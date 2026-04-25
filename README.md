@@ -44,8 +44,6 @@ A star topology (rather than a chain) ensures that silent corruption on one seco
 
 ## One-time setup
 
-See [`PLAN-VAN-AANPAK.md`](PLAN-VAN-AANPAK.md) for the full setup procedure (in Dutch). The short version:
-
 1. Format each stick as a Case-sensitive APFS encrypted volume with `diskutil eraseDisk` + `diskutil apfs encryptVolume`
 2. Label them `BACKUP_A`, `BACKUP_B`, `BACKUP_C`, `BACKUP_D` (or whatever you configure in `LABELS`)
 3. Use the **same passphrase** for all sticks
@@ -158,7 +156,6 @@ Every run writes a timestamped log to `~/Library/Logs/usb-backup/backup-<timesta
 ## Files in this project
 
 - [`usb-mirror-backup.sh`](usb-mirror-backup.sh) — the backup script
-- [`PLAN-VAN-AANPAK.md`](PLAN-VAN-AANPAK.md) — detailed setup, design rationale, recovery procedures, and threat model (in Dutch)
 - [`README.md`](README.md) — this file
 
 ## License
