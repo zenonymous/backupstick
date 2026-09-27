@@ -44,6 +44,8 @@ A star topology (rather than a chain) ensures that silent corruption on one seco
 
 ## One-time setup
 
+See [`docs/SETUP.md`](docs/SETUP.md) for exact commands.
+
 1. Format each stick as a Case-sensitive APFS encrypted volume with `diskutil eraseDisk` + `diskutil apfs encryptVolume`
 2. Label them `BACKUP_A`, `BACKUP_B`, `BACKUP_C`, `BACKUP_D` (or whatever you configure in `LABELS`)
 3. Use the **same passphrase** for all sticks
@@ -157,6 +159,12 @@ Every run writes a timestamped log to `~/Library/Logs/usb-backup/backup-<timesta
 
 - [`usb-mirror-backup.sh`](usb-mirror-backup.sh) — the backup script
 - [`README.md`](README.md) — this file
+- [`docs/SETUP.md`](docs/SETUP.md) — step-by-step one-time stick setup
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how the script works internally
+- [`docs/TESTING.md`](docs/TESTING.md) — testing without a Mac (mocked `diskutil`)
+- [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) — known bugs and gotchas
+- [`CLAUDE.md`](CLAUDE.md) / [`AGENTS.md`](AGENTS.md) — guide for AI coding agents
+- [`CHANGELOG.md`](CHANGELOG.md) — history
 
 ## License
 
