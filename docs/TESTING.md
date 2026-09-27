@@ -1,108 +1,82 @@
 # Testing
 
-There is no automated test suite yet. Two ways to test changes:
-
-## 1. Static checks (anywhere)
+## Quick start
 
 ```bash
-bash -n usb-mirror-backup.sh
-shellcheck usb-mirror-backup.sh      # pip install shellcheck-py, or brew install shellcheck
+tests/run-tests.sh              # all tests
+tests/run-tests.sh history      # only tests whose name contains "history"
+shellcheck usb-mirror-backup.sh tests/*.sh tests/mocks/diskutil tests/mocks/launchctl tests/mocks/osascript tests/mocks/linux/*
 ```
 
-Both must pass. `shellcheck` does **not** catch bash-3.2 incompatibilities; review
-those by hand (see `CLAUDE.md`).
+Needs `bash`, `rsync` and the usual coreutils. No root, no real disks. On Linux,
+`pip install shellcheck-py` gives you `shellcheck`.
 
-## 2. Linux mock harness (no Mac needed)
+CI (`.github/workflows/ci.yml`) runs ShellCheck and the suite on Ubuntu (bash 5,
+GNU tools, rsync 3.x) and on macOS with `BASH_UNDER_TEST=/bin/bash`: real bash 3.2,
+BSD `find`/`mktemp`, `shasum`, and Apple's openrsync. The macOS job is the one
+that matters most; the script's real users run exactly that toolchain.
 
-The script only talks to macOS through `uname`, `diskutil`, `shasum` and BSD
-`mktemp`. Fake those on `PATH` and the full flow runs on Linux. The harness below
-was used to verify the bugs in `KNOWN_ISSUES.md`. It needs root because it
-writes to `/Volumes`, so run it in a throwaway container, never on a real Mac.
+## How it works
 
-A mocked stick is "present" when `/tmp/mockstate/<LABEL>.present` exists.
-"Unlocking" moves `/tmp/mockstate/<LABEL>.data` to `/Volumes/<LABEL>`, "locking"
-moves it back.
+The script only reaches macOS through a few commands, which the suite fakes on `PATH`:
+
+| Mock | Behaviour |
+|------|-----------|
+| `tests/mocks/diskutil` | Sticks live in `$MOCK_STATE`: `<LABEL>.present` = plugged in, `<LABEL>.data/` = contents while locked. `unlockVolume` checks the passphrase against `$MOCK_PASSPHRASE` and moves the data dir to `$MOCK_VOLUMES/<LABEL>`; `lockVolume` moves it back. Also `info`, `unmount`, `eraseDisk` (needs `$MOCK_STATE/disks/<diskN>`), `apfs encryptVolume`. Every call is appended to `$MOCK_STATE/diskutil.calls`. |
+| `tests/mocks/launchctl`, `osascript` | Record their arguments in `$MOCK_STATE/*.calls`. |
+| `tests/mocks/linux/{uname,shasum,mktemp}` | Linux only: report Darwin, map `shasum -a 256` to `sha256sum`, accept BSD `mktemp -t prefix`. |
+
+Mock knobs: `MOCK_UNLOCK_DELAY` (seconds), `MOCK_LOCK_FAIL=<LABEL>` (first lock fails, tests
+the force-unmount path), `MOCK_ENCRYPT_FAIL=1`.
+
+Each test gets a fresh temp dir `$T` with sources in `$T/src/{docs,keys}` and a config
+file (`$T/test.conf`) that sets `SOURCES`, `LOG_DIR`, `STATE_DIR` and
+`VOLUMES_ROOT=$MOCK_VOLUMES`, so the script never touches `/Volumes` or your home directory.
+`HOME` is also pointed at `$T/home`.
+
+## Writing a test
+
+Add a function named `test_...` to `tests/test-cases.sh`; it is picked up automatically.
 
 ```bash
-T=$(mktemp -d); mkdir -p "$T/bin" "$T/src/docs"; cd "$T"
-
-cat > bin/uname <<'EOF'
-#!/bin/sh
-echo Darwin
-EOF
-
-cat > bin/shasum <<'EOF'
-#!/bin/sh
-# shasum -a 256 <args>  ->  sha256sum <args>
-shift 2; exec sha256sum "$@"
-EOF
-
-cat > bin/mktemp <<'EOF'
-#!/bin/bash
-# BSD `mktemp [-d] -t prefix` -> GNU needs a template
-a=(); while [[ $# -gt 0 ]]; do if [[ $1 == -t ]]; then a+=(-t "$2.XXXXXX"); shift; else a+=("$1"); fi; shift; done
-exec /usr/bin/mktemp "${a[@]}"
-EOF
-
-cat > bin/diskutil <<'EOF'
-#!/bin/bash
-st=/tmp/mockstate
-case "$1" in
-  info) l="${2#/Volumes/}"; [[ -e $st/$l.present ]] || exit 1
-        echo "   File System Personality:  APFS" ;;
-  apfs) case "$2" in
-          unlockVolume) cat >/dev/null; rm -rf "/Volumes/$3"; mv "$st/$3.data" "/Volumes/$3" ;;
-          lockVolume)   mv "/Volumes/$3" "$st/$3.data" ;;
-        esac ;;
-  unmount) exit 1 ;;
-esac
-EOF
-chmod +x bin/*
-
-# Four mocked sticks with a shared canary
-mkdir -p /tmp/mockstate
-for l in BACKUP_A BACKUP_B BACKUP_C BACKUP_D; do
-  touch /tmp/mockstate/$l.present
-  mkdir -p /tmp/mockstate/$l.data
-  echo canary > /tmp/mockstate/$l.data/INTEGRITY_CANARY.txt
-  (cd /tmp/mockstate/$l.data && sha256sum INTEGRITY_CANARY.txt > .canary.sha256)
-done
-
-# Copy of the script pointing at a test source and a local log dir
-echo hello > src/docs/a.txt
-sed "s|^    # \"\${HOME}/Documents/backup-me\"|    \"$T/src/docs\"|; s|^LOG_DIR=.*|LOG_DIR=$T/logs|" \
-  /path/to/backupstick/usb-mirror-backup.sh > test.sh
-
-export PATH="$T/bin:$PATH" USB_BACKUP_PASSPHRASE=dummy
-bash test.sh --no-color; echo "exit=$?"
+test_something() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D   # plugged-in, locked sticks with a shared canary
+    run_backup                                          # runs the script; sets $OUT and $RC
+    assert_rc 0
+    printf 'changed\n' > "${T}/src/docs/a.txt"
+    unplug BACKUP_D
+    run_backup --available-only
+    assert_out "Missing            BACKUP_D"
+    assert_locked BACKUP_A BACKUP_B BACKUP_C
+    assert_file "$(stick_dir BACKUP_A)/data/docs/a.txt"
+}
 ```
 
-(`rsync` must be installed: `apt-get install rsync`.)
+Fixture helpers: `make_stick LABEL [canary]`, `make_sticks`, `plug`, `unplug`, `stick_dir`,
+`is_unlocked`, `make_disk diskN [External|Internal]`, `corrupt_file_keep_size_mtime`.
+Knobs for `run_backup`: `SOURCES_LINE`, `EXTRA_CONFIG` (appended to the config),
+`STDIN_INPUT` (e.g. the `--init-stick` confirmation), `PASS_OVERRIDE` (wrong passphrase).
 
-Useful scenarios:
+Assertions: `assert_rc`, `assert_out`, `assert_not_out`, `assert_count`, `assert_log`,
+`assert_file`, `assert_no_file`, `assert_same_file`, `assert_locked`, `assert_unlocked`,
+or `fail "message"` for anything custom. They record failures without stopping the test;
+a failing test prints the tail of the script output.
 
-| Scenario | How |
-|----------|-----|
-| Happy path | run as above, expect exit 0 and `/tmp/mockstate/*/data/docs/a.txt` |
-| Offsite stick | `rm /tmp/mockstate/BACKUP_D.present`, run with `--available-only` |
-| Too few sticks | remove two `.present` files, run with `--available-only`, expect exit 2 |
-| Stale stick returns | change a source, run `--available-only` without D, put D back, run `--dry-run` |
-| Hash mismatch | after a successful run, change the content of `/tmp/mockstate/BACKUP_C.data/data/docs/a.txt` but keep its size and mtime (`touch -r` from a copy), so rsync skips it; then run again |
-| Canary failure | edit `/tmp/mockstate/BACKUP_B.data/INTEGRITY_CANARY.txt`, expect exit 4 |
-| Wrong passphrase | make the mock `unlockVolume` `exit 1`, expect exit 5 |
+Two runs in the same second share a `TIMESTAMP` (log name and snapshot name). Tests
+that need distinct snapshots `sleep 1` between runs.
 
-Logs land in `$T/logs/`. After a failed run check `ls /Volumes` to see
-whether sticks were left "unlocked".
+## What the mocks don't cover
 
-What the mock does **not** cover: real `diskutil` output formats, async mounts,
-lock failures caused by Spotlight, Apple rsync 2.6.9 / openrsync flag
-differences, and bash 3.2 itself (Linux has bash 5). Those need a real Mac.
+Real `diskutil` output formats and error behaviour, async mounting, `eraseDisk` and
+`encryptVolume` on real hardware, Spotlight holding files open, `sudo mdutil`, real
+`launchd` scheduling and notifications. See `docs/KNOWN_ISSUES.md` for what has not been
+tried on a real Mac. To try those safely, use a spare stick; or for the backup flow,
+disk images:
 
-## 3. On a real Mac
+```bash
+printf '%s' 'test-pass' | hdiutil create -size 200m -fs APFSX -encryption AES-256 \
+    -volname BACKUP_A -stdinpass test_a.dmg
+hdiutil attach test_a.dmg          # repeat per label
+```
 
-1. Use spare sticks or a disk image, not your real backup set:
-   `hdiutil create -size 200m -fs APFSX -encryption AES-256 -volname BACKUP_A -stdinpass test_a.dmg`
-   (repeat per label; attach with `hdiutil attach`), then follow `docs/SETUP.md` steps 4–6.
-2. Run with `/bin/bash usb-mirror-backup.sh` to make sure you are on bash 3.2.
-3. Try `--dry-run`, `--available-only`, Ctrl-C mid-rsync, and a run with Finder
-   open on a stick (tests the force-unmount path in `lock_volume`).
+(disk images are not "external" disks, so `--init-stick` refuses them by design.)

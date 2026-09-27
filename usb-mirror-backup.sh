@@ -392,9 +392,11 @@ usage() {
 Usage: usb-mirror-backup.sh [OPTIONS]
 
 Options:
-  --dry-run          Simulate the full flow without rsync writes or
-                     manifest updates. Volumes are still unlocked and
-                     hashes are still computed.
+  --dry-run          Simulate the full flow without changing the sticks
+                     (no rsync writes, snapshots, deletions or manifest
+                     updates). Volumes are still unlocked and hashed;
+                     out-of-date sticks and deletion-guard hits are
+                     reported as warnings.
   --available-only   Work with the sticks that are actually present
                      (minimum MIN_STICKS_AVAILABLE, default 3). Without
                      this flag, ALL configured sticks must be present.
@@ -1642,10 +1644,24 @@ init_stick() {
     mkdir -p "${mount}/${DATA_SUBDIR}"
     touch "${mount}/.metadata_never_index"
 
+    # Spotlight holding files open is the usual reason lockVolume fails.
+    # .metadata_never_index is a hint only; mdutil needs root.
+    local spotlight_off=0
+    if [[ -t 0 ]] && command -v mdutil >/dev/null 2>&1; then
+        log "Turning off Spotlight indexing (sudo may ask for your login password)"
+        # shellcheck disable=SC2024  # the log is ours; only mdutil needs root
+        if sudo mdutil -i off "$mount" >>"$LOG_FILE" 2>&1; then
+            spotlight_off=1
+            print_ok "Spotlight indexing off for ${label}"
+        fi
+    fi
+
     printf '\n' >&2
     print_ok "${label} is ready."
-    print_warn "Turn off Spotlight on it now: sudo mdutil -i off ${mount}"
-    print_warn "Then run a backup with this stick plugged in to fill it."
+    if [[ "$spotlight_off" -eq 0 ]]; then
+        print_warn "Turn off Spotlight for it: diskutil apfs unlockVolume ${label}; sudo mdutil -i off ${mount}; diskutil apfs lockVolume ${label}"
+    fi
+    print_warn "Next: run a backup with this stick plugged in to fill it."
     log_to_file "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] init of ${label} on ${disk} complete"
 }
 

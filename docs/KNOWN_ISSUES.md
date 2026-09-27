@@ -1,118 +1,89 @@
-# Known issues
+# Known issues and limitations
 
-Found during a code review on 2026-09-27. Items marked **verified** were
-reproduced with the Linux mock harness in `docs/TESTING.md`; the others come
-from reading the code or rsync/macOS behaviour and have not been run on a real Mac.
+Updated 2026-09-27. The bugs found in the first review (wrong exit code on hash
+mismatch, dry-run failures, zero counts in the summary, double cleanup on Ctrl-C,
+silent `set -e` exits, stale sources, basename collisions, passphrase in the hook's
+environment) are fixed and covered by tests; see `CHANGELOG.md`.
 
-When you fix one, delete it here and add a `CHANGELOG.md` entry.
+When you fix or verify something here, update this file and add a changelog entry.
 
-## Bugs
+## Not yet verified on a real Mac
 
-### 1. Hash mismatch exits 1, not 3, and locks the sticks — verified
+The test suite runs on macOS in CI (bash 3.2, openrsync), but with a **mocked `diskutil`**.
+These parts have only been tested against the mock:
 
-`verify_all_sticks_identical` logs the diff with
-`diff "$hub_hashes" "$other_hashes" | head -30`. `diff` returns 1 when the files
-differ, `pipefail` makes the pipeline fail, and `set -e` kills the script
-right there. Result: exit code **1** instead of 3, the "Mismatches:" log line is
-never written, and `cleanup` **locks** the volumes, so the documented
-"leave unlocked for forensics" behaviour never happens.
-Fix: `{ diff … | head -30; } || true` (or `diff … | head -30 || true`).
+1. **`--init-stick`**: `diskutil eraseDisk APFSX …`, `diskutil apfs encryptVolume … -user disk -stdinpassphrase`
+   and the `diskutil info` fields used for the external-disk check (`Whole`,
+   `Device Location`, `Protocol`). If `encryptVolume` rejects `-stdinpassphrase` on your macOS,
+   the command fails with exit 5 and tells you the new volume is not encrypted; fall back
+   to the manual steps in `docs/SETUP.md`. First real use: a spare stick.
+2. **Locking a freshly encrypted volume** at the end of `--init-stick` while encryption may
+   still be finishing in the background.
+3. **`--install-reminder`**: the plist is checked with `plutil -lint` in CI, but whether
+   launchd fires it and the notification appears has not been observed.
+4. **Spotlight**: `.metadata_never_index` is only a hint on recent macOS; `sudo mdutil -i off`
+   is what counts.
 
-### 2. `--dry-run` fails when a stick is out of date — verified
+## Limitations
 
-In dry-run mode nothing is synced, but phase 5 still hashes and compares the
-sticks. If any secondary differs from the hub (e.g. the offsite stick just came
-home), a dry run reports a hash mismatch and fails. Once #1 is fixed it would
-exit 3 and leave the sticks unlocked. Dry run should skip the comparison
-or report it as "would be updated".
+### 5. Verification compares sticks with each other, not with the sources
 
-### 3. The success summary always shows "Files 0 / Size 0 B" — verified
+A backup run checks that all sticks agree. A file read wrongly from the Mac would be
+copied to every stick and pass. rsync's own transfer checksum makes this unlikely; a
+source-vs-hub hash check was proposed but not implemented.
 
-`cleanup` locks the volumes first and only then calls `print_summary`, which
-counts files on the (now unmounted) hub. Compute the stats before locking,
-e.g. store them in globals in `write_manifests_to_all_sticks`.
+### 6. Corruption on the hub looks like corruption on every secondary
 
-### 4. `--dry-run` on a fresh stick dies with exit 2
+If a file rots on the hub (first present stick), the run reports a mismatch on *all*
+secondaries (exit 3). Run `--verify-only` to see which stick really changed: it checks
+each stick against its own stored hashes.
 
-`mkdir -p <mount>/data` is skipped in dry-run, and `generate_file_manifest`
-calls `die 2` if `data/` does not exist.
+### 7. In-place modifications are mirrored
 
-### 5. Ctrl-C / SIGTERM runs `cleanup` twice
+The deletion guard only counts deletions. Ransomware that encrypts files in place (same
+names) passes the guard and is mirrored to the present sticks. The previous versions stay
+in `history/` for `HISTORY_KEEP` changing runs, and on the offsite stick.
 
-`trap cleanup EXIT INT TERM`: the INT handler calls `exit`, which fires the EXIT
-trap and runs `cleanup` again: double summary and double end-of-run log line.
-The summary may also say "Backup Complete" if `$?` happened to be 0 when the
-signal arrived. Usual fix: `trap cleanup EXIT; trap 'exit 130' INT; trap 'exit 143' TERM`.
+### 8. `history/` is not verified
 
-### 6. Unexpected failures exit silently with code 1
+Snapshots are hard links of earlier `data/` states. They are not in `BACKUP_HASHES.txt`.
+Also, if rsync only changes a file's permissions or mtime (not content), it does that in
+place, so the snapshot's copy gets the new metadata too (content is unaffected).
 
-Any command that fails under `set -e` outside a `die` call (e.g. `mktemp`,
-`diff`, a full disk) ends the run with exit 1 and **no message** saying what
-failed; the summary just says "Backup Failed". An `ERR` trap that logs
-`$BASH_COMMAND` and `$LINENO` would make these diagnosable.
+### 9. Canary is corruption detection, not tamper-proofing
 
-### 7. `die` before logging is initialised
+`.canary.sha256` lives next to the canary on the same volume. Anyone who can unlock the
+stick can change both.
 
-`parse_args` runs before `init_logging`, so `die 1 "Unknown option"` writes to
-`>> ""` and bash prints a "No such file or directory" error. The exit code is
-still 1 by coincidence.
+### 10. "Total bytes" / "Size" is disk usage, not file size
 
-## Design gotchas (behaviour to be aware of)
+`bytes_under_data` uses `du -sk`: allocated blocks, rounded to KiB.
 
-### 8. Sources removed from `SOURCES` are never deleted from sticks — verified
+### 11. Filenames containing newlines
 
-Each source is rsynced as `rsync --delete <src> data/`. `--delete` only acts
-inside `data/<basename>`, so a top-level entry for a removed source stays on
-every stick forever (and inflates the manifest file count).
+File lists and hash files are newline-separated. A backed-up filename containing a
+newline would confuse the deletion guard and the hash comparison. Not a realistic case
+for this data, so not handled.
 
-### 9. Basename collisions
+### 12. Failures inside `$(...)` are not caught by `set -e`
 
-`~/a/notes` and `~/b/notes` both land in `data/notes/`, and with `--delete` the
-second one wipes the first one's files every run. `preflight` does not check this.
+Bash doesn't propagate `set -e` into command substitutions (and bash 3.2 has no
+`inherit_errexit`). A failing command inside `$(...)` usually yields an empty or zero
+value instead of stopping the run. Only affects statistics today (`bytes_under_data`).
 
-### 10. No history: deletions and corruption propagate
+### 13. Two runs in the same second
 
-It is a mirror. If a source file is deleted, encrypted by ransomware, or
-corrupted on the Mac, the next run faithfully copies that to every present stick.
-Only the offsite stick keeps the old version, until the next rotation run.
-There is no `--max-delete` safety limit or versioned copy.
+The run `TIMESTAMP` has one-second resolution; it names the log file and the snapshot
+directory. Two runs within one second would share both. Only happens in tests.
 
-### 11. Verification does not compare against the sources
+### 14. Apple Notes is copied live
 
-Phase 5 checks that the sticks agree **with each other**. A bad read/write
-between the Mac and the hub would be copied to every secondary and pass.
+The Notes group container holds SQLite databases with WAL files. Copying them while
+Notes is running can give an inconsistent snapshot. Quit Notes first, or use
+`PRE_BACKUP_HOOK` to export notes instead.
 
-### 12. Per-file hashes are not stored on the sticks
+### 15. rsync progress output with openrsync
 
-Only the root hash goes into `BACKUP_MANIFEST.txt`, so a single stick (e.g. the
-offsite one) cannot be checked for bit-rot on its own, without the other sticks.
-
-### 13. Canary is corruption detection, not tamper-proofing
-
-`.canary.sha256` lives next to the canary on the same volume. Anyone who can
-unlock the stick can change both. The README says the canary "detects tampering",
-which overstates what it does.
-
-### 14. `USB_BACKUP_PASSPHRASE` stays in the environment
-
-When the passphrase comes from the environment it is copied to `PASSPHRASE`
-and cleared, but the exported variable itself is never `unset`, so child
-processes (`rsync`, and the `PRE_BACKUP_HOOK` via `eval`) inherit it.
-
-### 15. "Total bytes" is disk usage, not file size
-
-`bytes_under_data` uses `du -sk`, which reports allocated blocks rounded to KiB.
-
-### 16. rsync version detection and `openrsync` (unverified)
-
-Recent macOS releases ship `openrsync` behind `/usr/bin/rsync`. Its
-`--version` first line has no `N.N` token, so `detect_rsync_capabilities`
-falls back to `--progress`. Whether openrsync accepts every flag used
-(`--human-readable`, `--exclude=`, `--delete`) has not been checked on a real
-Mac. If a run fails with exit 6 right after upgrading macOS, look here first.
-
-### 17. Apple Notes is copied live
-
-The Notes group container holds SQLite databases with WAL files. Copying them
-while Notes is running can give an inconsistent snapshot. The README tells you to
-quit Notes first; `PRE_BACKUP_HOOK` can be used to export notes instead.
+`detect_rsync_capabilities` doesn't recognise openrsync's version line and falls back to
+`--progress` (per-file progress). This works (CI runs openrsync), it's just less pretty
+than Homebrew rsync 3.x's single progress line.
