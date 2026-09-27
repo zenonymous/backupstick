@@ -1,0 +1,3 @@
+#!/bin/bash
+# Mock osascript: records the script in $MOCK_STATE/osascript.calls.
+echo "$*" >> "${MOCK_STATE:?}/osascript.calls"

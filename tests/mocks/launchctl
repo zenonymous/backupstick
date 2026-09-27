@@ -1,0 +1,3 @@
+#!/bin/bash
+# Mock launchctl: records calls in $MOCK_STATE/launchctl.calls.
+echo "launchctl $*" >> "${MOCK_STATE:?}/launchctl.calls"

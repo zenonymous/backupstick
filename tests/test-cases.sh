@@ -390,6 +390,9 @@ test_history_snapshot_keeps_old_version() {
         snap="$(find "$(stick_dir "$l")/history" -mindepth 1 -maxdepth 1 -type d)"
         grep -q hello "${snap}/docs/a.txt" || fail "$l snapshot lacks old version"
         grep -q 'version 2' "$(stick_dir "$l")/data/docs/a.txt" || fail "$l data not updated"
+        # unchanged files must be hard links (no extra space), not copies
+        [[ "${snap}/docs/b.txt" -ef "$(stick_dir "$l")/data/docs/b.txt" ]] \
+            || fail "$l snapshot of unchanged b.txt is not a hard link"
     done
 }
 
@@ -484,4 +487,193 @@ test_verify_only_writes_nothing() {
     assert_rc 0
     [[ "$before" == "$(cat "$(stick_dir BACKUP_A)/BACKUP_MANIFEST.txt")" ]] || fail "manifest changed"
     grep -q hello "$(stick_dir BACKUP_A)/data/docs/a.txt" || fail "data changed"
+}
+
+# --- --init-stick (D) ---------------------------------------------------------
+
+make_disk() {
+    # make_disk diskN External|Internal
+    cat > "${MOCK_STATE}/disks/$1" <<INFO
+   Device Identifier:         $1
+   Whole:                     Yes
+   Device / Media Name:       Mock USB Stick
+   Protocol:                  USB
+   Device Location:           ${2:-External}
+   Disk Size:                 64.0 GB (64000000000 Bytes)
+INFO
+}
+
+test_init_stick_copies_canary_and_encrypts() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C
+    make_disk disk9
+    STDIN_INPUT="BACKUP_D"
+    run_backup --init-stick BACKUP_D --disk disk9
+    assert_rc 0
+    assert_out "BACKUP_D is ready"
+    assert_file "${MOCK_STATE}/disk9.erased"
+    [[ "$(cat "${MOCK_STATE}/BACKUP_D.encrypted" 2>/dev/null)" == "secret" ]] || fail "not encrypted with the set passphrase"
+    assert_locked BACKUP_A BACKUP_D
+    assert_same_file "$(stick_dir BACKUP_A)/INTEGRITY_CANARY.txt" "$(stick_dir BACKUP_D)/INTEGRITY_CANARY.txt"
+    assert_file "$(stick_dir BACKUP_D)/data"
+    # the new stick joins a normal full backup
+    STDIN_INPUT=""
+    run_backup
+    assert_rc 0
+    assert_file "$(stick_dir BACKUP_D)/data/docs/a.txt"
+}
+
+test_init_stick_refuses_internal_disk() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C
+    make_disk disk0 Internal
+    STDIN_INPUT="BACKUP_D"
+    run_backup --init-stick BACKUP_D --disk disk0
+    assert_rc 1
+    assert_out "Refusing to erase"
+    assert_no_file "${MOCK_STATE}/disk0.erased"
+}
+
+test_init_stick_refuses_partition() {
+    make_sticks BACKUP_A
+    STDIN_INPUT="BACKUP_D"
+    run_backup --init-stick BACKUP_D --disk disk9s1
+    assert_rc 1
+    assert_out "not a partition"
+}
+
+test_init_stick_wrong_confirmation() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C
+    make_disk disk9
+    STDIN_INPUT="yes"
+    run_backup --init-stick BACKUP_D --disk disk9
+    assert_rc 1
+    assert_out "Nothing was changed"
+    assert_no_file "${MOCK_STATE}/disk9.erased"
+}
+
+test_init_stick_wrong_passphrase_erases_nothing() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C
+    make_disk disk9
+    STDIN_INPUT="BACKUP_D"
+    PASS_OVERRIDE=wrong run_backup --init-stick BACKUP_D --disk disk9
+    assert_rc 5
+    assert_no_file "${MOCK_STATE}/disk9.erased"
+    assert_locked BACKUP_A
+}
+
+test_init_stick_existing_label_refused() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    make_disk disk9
+    STDIN_INPUT="BACKUP_D"
+    run_backup --init-stick BACKUP_D --disk disk9
+    assert_rc 1
+    assert_out "already exists"
+}
+
+test_init_stick_unknown_label_refused() {
+    make_sticks BACKUP_A
+    make_disk disk9
+    STDIN_INPUT="BACKUP_Z"
+    run_backup --init-stick BACKUP_Z --disk disk9
+    assert_rc 1
+    assert_out "not in LABELS"
+}
+
+test_init_stick_needs_reference_or_new_set() {
+    make_disk disk9
+    STDIN_INPUT="BACKUP_A"
+    run_backup --init-stick BACKUP_A --disk disk9
+    assert_rc 1
+    assert_out "--new-set"
+    assert_no_file "${MOCK_STATE}/disk9.erased"
+}
+
+test_init_stick_new_set() {
+    make_disk disk9
+    STDIN_INPUT="BACKUP_A"
+    run_backup --init-stick BACKUP_A --disk disk9 --new-set
+    assert_rc 0
+    assert_out "new backup set"
+    assert_locked BACKUP_A
+    ( cd "$(stick_dir BACKUP_A)" && PATH="$TEST_PATH" shasum -a 256 -c .canary.sha256 >/dev/null ) \
+        || fail "generated canary does not verify"
+}
+
+test_init_stick_encrypt_failure() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C
+    make_disk disk9
+    STDIN_INPUT="BACKUP_D"
+    export MOCK_ENCRYPT_FAIL=1
+    run_backup --init-stick BACKUP_D --disk disk9
+    unset MOCK_ENCRYPT_FAIL
+    assert_rc 5
+    assert_out "NOT encrypted"
+}
+
+# --- reminders (D) ------------------------------------------------------------
+
+state_file() { printf '%s' "${T}/home/state/last-sync"; }
+
+test_backup_records_last_sync() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    run_backup
+    assert_rc 0
+    [[ "$(wc -l < "$(state_file)" | tr -d ' ')" -eq 4 ]] || fail "expected 4 lines in state file"
+    run_backup --check-reminder
+    assert_rc 0
+    assert_out "Backups are up to date"
+}
+
+test_available_only_keeps_offsite_sync_time() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    mkdir -p "${T}/home/state"
+    printf 'BACKUP_D 1000 old\n' > "$(state_file)"
+    unplug BACKUP_D
+    run_backup --available-only
+    assert_rc 0
+    grep -q '^BACKUP_D 1000 ' "$(state_file)" || fail "offsite stick's time was overwritten"
+    run_backup --check-reminder
+    assert_rc 0
+    assert_out "BACKUP_D last synced"
+    grep -q 'BACKUP_D last synced' "${MOCK_STATE}/osascript.calls" || fail "no notification sent"
+}
+
+test_reminder_overdue_backup() {
+    mkdir -p "${T}/home/state"
+    local l
+    for l in BACKUP_A BACKUP_B BACKUP_C BACKUP_D; do
+        printf '%s %s x\n' "$l" "$(( $(date +%s) - 10 * 86400 ))" >> "$(state_file)"
+    done
+    run_backup --check-reminder
+    assert_rc 0
+    assert_out "Last USB backup was 10 days ago"
+}
+
+test_reminder_no_state() {
+    run_backup --check-reminder
+    assert_rc 0
+    assert_out "No USB backup has been recorded yet"
+}
+
+test_dry_run_does_not_record_sync() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    run_backup --dry-run
+    assert_rc 0
+    assert_no_file "$(state_file)"
+}
+
+test_install_and_uninstall_reminder() {
+    write_config
+    run_backup --install-reminder --config "${T}/test.conf"
+    assert_rc 0
+    local plist="${T}/home/Library/LaunchAgents/com.backupstick.reminder.plist"
+    assert_file "$plist"
+    grep -q '<string>--check-reminder</string>' "$plist" || fail "plist lacks --check-reminder"
+    grep -q "<string>${T}/test.conf</string>" "$plist" || fail "plist lacks --config path"
+    grep -q 'launchctl bootstrap' "${MOCK_STATE}/launchctl.calls" || fail "launchctl bootstrap not called"
+    if command -v plutil >/dev/null 2>&1; then
+        plutil -lint "$plist" >/dev/null || fail "plist is not valid (plutil -lint)"
+    fi
+    run_backup --uninstall-reminder
+    assert_rc 0
+    assert_no_file "$plist"
 }

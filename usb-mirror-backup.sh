@@ -20,6 +20,9 @@
 #        ./usb-mirror-backup.sh --allow-deletions   # bypass the deletion guard once
 #        ./usb-mirror-backup.sh --no-color          # disable colored output
 #        ./usb-mirror-backup.sh --config FILE       # settings file
+#        ./usb-mirror-backup.sh --init-stick BACKUP_B --disk disk4 [--new-set]
+#        ./usb-mirror-backup.sh --check-reminder    # notify if backups are overdue
+#        ./usb-mirror-backup.sh --install-reminder  # daily check via launchd
 #        ./usb-mirror-backup.sh --help
 #
 # Exit codes:
@@ -120,6 +123,14 @@ MAX_DELETE_MIN=10
 HISTORY_KEEP=8
 HISTORY_SUBDIR="history"
 
+# Reminders (--check-reminder, run daily by --install-reminder). Each
+# successful backup records per stick when it was last synced, in STATE_DIR.
+# A macOS notification appears if no backup ran for REMIND_AFTER_DAYS, or a
+# stick (typically the offsite one) wasn't synced for REMIND_STICK_DAYS.
+REMIND_AFTER_DAYS=8
+REMIND_STICK_DAYS=42
+STATE_DIR="${HOME}/Library/Application Support/usb-backup"
+
 # =============================================================================
 # END CONFIGURATION  —  don't edit below unless you know what you're doing
 # =============================================================================
@@ -129,6 +140,10 @@ DRY_RUN=0
 AVAILABLE_ONLY=0
 VERIFY_ONLY=0
 ALLOW_DELETIONS=0
+MODE="backup"          # backup | verify | init | check-reminder | install-reminder | uninstall-reminder
+INIT_LABEL=""
+INIT_DISK=""
+INIT_NEW_SET=0
 NO_COLOR=0
 CONFIG_FILE=""
 PRESENT_LABELS=()
@@ -392,6 +407,21 @@ Options:
                      MAX_DELETE_MIN) would stop it. Use after checking that
                      the deletions are intended.
   --no-color         Disable colored output and animations.
+
+  --init-stick LABEL --disk DISK [--new-set]
+                     Set up a new stick: ERASE the whole disk DISK (e.g.
+                     disk4, see 'diskutil list external'), format it as
+                     case-sensitive APFS named LABEL, encrypt it with the
+                     backup passphrase and install the integrity canary.
+                     Plug in one existing stick of the set too: its canary
+                     is copied and it proves the passphrase. --new-set
+                     starts a brand new backup set instead.
+  --check-reminder   Show a macOS notification if the last backup, or the
+                     last sync of any stick, is too old. No sticks needed.
+  --install-reminder Install a launchd agent that runs --check-reminder daily.
+  --uninstall-reminder
+                     Remove that launchd agent.
+
   --config FILE      Read settings from FILE (default: $USB_BACKUP_CONFIG,
                      else ~/.config/usb-backup/config if it exists).
   -h, --help         Show this help message.
@@ -1338,6 +1368,288 @@ verify_stored_hashes() {
 }
 
 # -----------------------------------------------------------------------------
+# Reminders (state file + launchd agent)
+# -----------------------------------------------------------------------------
+
+REMINDER_AGENT_LABEL="com.backupstick.reminder"
+
+state_file() {
+    printf '%s/last-sync' "$STATE_DIR"
+}
+
+record_last_sync() {
+    # Lines: "<LABEL> <epoch> <ISO time>". Updates present sticks, keeps the
+    # rest. Best effort: a failure here must not fail a good backup.
+    [[ "$DRY_RUN" -eq 0 ]] || return 0
+    local f now iso tmp label
+    f="$(state_file)"
+    now="$(date +%s)"
+    iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    mkdir -p "$STATE_DIR" 2>/dev/null || { print_warn "Cannot create ${STATE_DIR}; reminders not updated"; return 0; }
+    tmp="${f}.tmp"
+    {
+        if [[ -f "$f" ]]; then
+            awk -v present=" $(join_by "${PRESENT_LABELS[@]}") " \
+                'index(present, " " $1 " ") == 0' "$f"
+        fi
+        for label in "${PRESENT_LABELS[@]}"; do
+            printf '%s %s %s\n' "$label" "$now" "$iso"
+        done
+    } > "$tmp"
+    if ! mv "$tmp" "$f"; then
+        print_warn "Could not update ${f}"
+    fi
+}
+
+notify() {
+    # macOS notification + stdout (visible when run by hand or in launchd logs)
+    local msg="$1"
+    printf '%s\n' "$msg"
+    if command -v osascript >/dev/null 2>&1; then
+        local esc
+        # Drop quotes and backslashes so the AppleScript string literal stays intact.
+        esc="$(printf '%s' "$msg" | tr -d '\\"')"
+        osascript -e "display notification \"${esc}\" with title \"USB Mirror Backup\"" >/dev/null 2>&1 || true
+    fi
+}
+
+check_reminder() {
+    local f now newest=0 label line epoch days msgs=()
+    f="$(state_file)"
+    now="$(date +%s)"
+    if [[ ! -f "$f" ]]; then
+        notify "No USB backup has been recorded yet. Run usb-mirror-backup.sh."
+        return 0
+    fi
+    for label in "${LABELS[@]}"; do
+        line="$(awk -v l="$label" '$1 == l { print $2; exit }' "$f")"
+        if [[ -z "$line" ]]; then
+            msgs+=("${label} has never been synced")
+            continue
+        fi
+        epoch="$line"
+        [[ "$epoch" -gt "$newest" ]] && newest="$epoch"
+        days=$(( (now - epoch) / 86400 ))
+        if [[ "$days" -ge "$REMIND_STICK_DAYS" ]]; then
+            msgs+=("${label} last synced ${days} days ago (bring it home for a rotation run)")
+        fi
+    done
+    if [[ "$newest" -gt 0 ]]; then
+        days=$(( (now - newest) / 86400 ))
+        if [[ "$days" -ge "$REMIND_AFTER_DAYS" ]]; then
+            msgs=("Last USB backup was ${days} days ago" ${msgs[@]+"${msgs[@]}"})
+        fi
+    fi
+    if [[ "${#msgs[@]}" -eq 0 ]]; then
+        printf 'Backups are up to date.\n'
+        return 0
+    fi
+    local joined="" m
+    for m in "${msgs[@]}"; do
+        joined+="${joined:+; }${m}"
+    done
+    notify "$joined"
+}
+
+reminder_plist_path() {
+    printf '%s/Library/LaunchAgents/%s.plist' "$HOME" "$REMINDER_AGENT_LABEL"
+}
+
+xml_escape() {
+    local v="$1"
+    v="${v//&/&amp;}"; v="${v//</&lt;}"; v="${v//>/&gt;}"
+    printf '%s' "$v"
+}
+
+install_reminder() {
+    local plist script config_args=""
+    plist="$(reminder_plist_path)"
+    script="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    if [[ -n "$CONFIG_FILE" ]]; then
+        config_args="        <string>--config</string>
+        <string>$(xml_escape "$CONFIG_FILE")</string>"
+    fi
+    mkdir -p "$(dirname "$plist")"
+    cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${REMINDER_AGENT_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$(xml_escape "$script")</string>
+        <string>--check-reminder</string>
+${config_args}
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>10</integer>
+        <key>Minute</key>
+        <integer>7</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
+EOF
+    launchctl bootout "gui/$(id -u)" "$plist" >/dev/null 2>&1 || true
+    if ! launchctl bootstrap "gui/$(id -u)" "$plist"; then
+        die 1 "launchctl bootstrap failed for ${plist}"
+    fi
+    print_ok "Reminder installed: daily check at 10:07 (${plist})"
+    print_ok "It runs ${script}; re-run --install-reminder if you move the script."
+}
+
+uninstall_reminder() {
+    local plist
+    plist="$(reminder_plist_path)"
+    launchctl bootout "gui/$(id -u)" "$plist" >/dev/null 2>&1 || true
+    rm -f "$plist"
+    print_ok "Reminder removed"
+}
+
+# -----------------------------------------------------------------------------
+# --init-stick: format, encrypt and install the canary on a new stick
+# -----------------------------------------------------------------------------
+
+disk_is_external_whole_disk() {
+    # Refuse anything that isn't a whole, external/USB disk. This is the only
+    # thing standing between a typo and erasing the Mac's internal disk.
+    local info="$1"
+    grep -Eq '^[[:space:]]*Whole:[[:space:]]+Yes' <<<"$info" || return 1
+    grep -Eq '^[[:space:]]*(Device Location:[[:space:]]+External|Protocol:[[:space:]]+USB)' <<<"$info" || return 1
+    ! grep -Eq '^[[:space:]]*Device Location:[[:space:]]+Internal' <<<"$info"
+}
+
+prompt_new_passphrase() {
+    if [[ -n "${USB_BACKUP_PASSPHRASE:-}" ]]; then
+        PASSPHRASE="$USB_BACKUP_PASSPHRASE"
+        unset USB_BACKUP_PASSPHRASE
+        return 0
+    fi
+    [[ -t 0 ]] || die 1 "No passphrase in environment and stdin is not a TTY. Cannot prompt."
+    local pw1 pw2
+    printf '  New backup-set passphrase (hidden): ' >&2
+    IFS= read -rs pw1; printf '\n' >&2
+    printf '  Repeat passphrase: ' >&2
+    IFS= read -rs pw2; printf '\n' >&2
+    [[ -n "$pw1" ]] || die 1 "Empty passphrase."
+    [[ "$pw1" == "$pw2" ]] || die 1 "Passphrases do not match."
+    PASSPHRASE="$pw1"
+}
+
+init_stick() {
+    local label="$INIT_LABEL" disk="$INIT_DISK"
+    local mount ref="" l
+
+    print_phase 1 3 "Checks"
+    [[ "$(uname -s)" == "Darwin" ]] || die 2 "This script is for macOS (Darwin). Current OS: $(uname -s)"
+    require_tool diskutil
+    require_tool shasum
+    [[ -n "$disk" ]] || die 1 "--init-stick needs --disk DISK (see: diskutil list external)"
+    case "$disk" in
+        disk[0-9]*) ;;
+        *) die 1 "--disk must look like disk4 (got '${disk}')" ;;
+    esac
+    case "$disk" in
+        *s[0-9]*) die 1 "--disk must be a whole disk like disk4, not a partition (${disk})" ;;
+    esac
+    local known=0
+    for l in "${LABELS[@]}"; do
+        [[ "$l" == "$label" ]] && known=1
+    done
+    [[ "$known" -eq 1 ]] || die 1 "${label} is not in LABELS ($(join_by "${LABELS[@]}")). Add it to your config first."
+    if apfs_volume_present "$label"; then
+        die 1 "A volume named ${label} already exists. Refusing to create a second one."
+    fi
+
+    local info
+    info="$(diskutil info "$disk" 2>/dev/null)" || die 2 "diskutil info ${disk} failed: no such disk?"
+    if ! disk_is_external_whole_disk "$info"; then
+        die 1 "${disk} is not a whole external/USB disk. Refusing to erase it."
+    fi
+
+    detect_present_sticks
+    if [[ "$INIT_NEW_SET" -eq 0 ]]; then
+        [[ "${#PRESENT_LABELS[@]}" -gt 0 ]] \
+            || die 1 "Plug in one existing stick of the backup set (its canary is copied and it proves the passphrase), or use --new-set to start a new set."
+        ref="${PRESENT_LABELS[0]}"
+        print_ok "Reference stick: ${ref}"
+    elif [[ "${#PRESENT_LABELS[@]}" -gt 0 ]]; then
+        print_warn "--new-set: a new canary is created; $(join_by "${PRESENT_LABELS[@]}") will NOT be in the same set as ${label}"
+    fi
+
+    local media size
+    media="$(awk -F': *' '/Device \/ Media Name:/ { print $2; exit }' <<<"$info")"
+    size="$(awk -F': *' '/Disk Size:/ { print $2; exit }' <<<"$info")"
+    printf '\n  %sAbout to ERASE %s%s (%s, %s).\n  Everything on it will be lost.\n' \
+        "$C_BOLD$C_RED" "/dev/${disk}" "$C_RESET" "${media:-unknown media}" "${size:-unknown size}" >&2
+    printf '  Type the new volume name (%s) to continue: ' "$label" >&2
+    local answer=""
+    IFS= read -r answer || true
+    [[ "$answer" == "$label" ]] || die 1 "Confirmation did not match. Nothing was changed."
+
+    if [[ -n "$ref" ]]; then
+        prompt_passphrase
+        unlock_volume "$ref"      # proves the passphrase before anything is erased
+        verify_canary "$ref"
+    else
+        prompt_new_passphrase
+    fi
+
+    print_phase 2 3 "Formatting and encrypting ${label}"
+    log "Erasing ${disk} as case-sensitive APFS volume ${label}"
+    UNLOCKED_LABELS+=("$label")
+    if ! diskutil eraseDisk APFSX "$label" GPT "$disk" >>"$LOG_FILE" 2>&1; then
+        die 5 "diskutil eraseDisk failed (see log)"
+    fi
+    print_ok "Formatted /dev/${disk} as ${label}"
+    mount="$(mount_point_for "$label")"
+    local _attempt
+    for _attempt in 1 2 3 4 5 6 7 8 9 10; do
+        [[ -d "$mount" ]] && break
+        sleep 1
+    done
+    [[ -d "$mount" ]] || die 5 "${mount} did not appear after formatting"
+
+    if ! printf '%s\n' "$PASSPHRASE" \
+        | diskutil apfs encryptVolume "$label" -user disk -stdinpassphrase >>"$LOG_FILE" 2>&1; then
+        die 5 "diskutil apfs encryptVolume failed (see log). ${label} exists but is NOT encrypted: erase it again."
+    fi
+    PASSPHRASE=""
+    print_ok "Encryption enabled on ${label}"
+
+    print_phase 3 3 "Canary and layout"
+    if [[ -n "$ref" ]]; then
+        local ref_mount
+        ref_mount="$(mount_point_for "$ref")"
+        cp "${ref_mount}/INTEGRITY_CANARY.txt" "${ref_mount}/.canary.sha256" "${mount}/"
+        print_ok "Copied canary from ${ref}"
+    else
+        {
+            printf 'usb-mirror-backup integrity canary\n'
+            printf 'Created: %s on %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(hostname)"
+            printf 'Set ID: %s\n' "$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+        } > "${mount}/INTEGRITY_CANARY.txt"
+        ( cd "$mount" && shasum -a 256 INTEGRITY_CANARY.txt > .canary.sha256 )
+        print_ok "Created a new canary (new backup set)"
+    fi
+    verify_canary "$label"
+    mkdir -p "${mount}/${DATA_SUBDIR}"
+    touch "${mount}/.metadata_never_index"
+
+    printf '\n' >&2
+    print_ok "${label} is ready."
+    print_warn "Turn off Spotlight on it now: sudo mdutil -i off ${mount}"
+    print_warn "Then run a backup with this stick plugged in to fill it."
+    log_to_file "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] init of ${label} on ${disk} complete"
+}
+
+# -----------------------------------------------------------------------------
 # Passphrase prompt
 # -----------------------------------------------------------------------------
 
@@ -1424,7 +1736,9 @@ cleanup() {
         rm -rf "$WORKDIR"
     fi
 
-    if [[ "$rc" -eq 0 ]]; then
+    if [[ "$MODE" == "init" ]]; then
+        :   # init_stick prints its own result
+    elif [[ "$rc" -eq 0 ]]; then
         print_summary "success"
     elif [[ -n "$HUB_LABEL" ]]; then
         print_summary "failure"
@@ -1444,7 +1758,19 @@ parse_args() {
         case "$1" in
             --dry-run) DRY_RUN=1 ;;
             --available-only) AVAILABLE_ONLY=1 ;;
-            --verify-only) VERIFY_ONLY=1 ;;
+            --verify-only) VERIFY_ONLY=1; MODE="verify" ;;
+            --init-stick)
+                [[ $# -ge 2 ]] || { usage >&2; die 1 "--init-stick needs a label"; }
+                MODE="init"; INIT_LABEL="$2"; shift
+                ;;
+            --disk)
+                [[ $# -ge 2 ]] || { usage >&2; die 1 "--disk needs a disk identifier"; }
+                INIT_DISK="${2#/dev/}"; shift
+                ;;
+            --new-set) INIT_NEW_SET=1 ;;
+            --check-reminder) MODE="check-reminder" ;;
+            --install-reminder) MODE="install-reminder" ;;
+            --uninstall-reminder) MODE="uninstall-reminder" ;;
             --allow-deletions) ALLOW_DELETIONS=1 ;;
             --no-color) NO_COLOR=1 ;;
             --config)
@@ -1596,6 +1922,14 @@ main() {
     parse_args "$@"
     load_config
     init_tty
+
+    # Modes that never touch the sticks: no log file, no cleanup trap.
+    case "$MODE" in
+        check-reminder)     check_reminder; return 0 ;;
+        install-reminder)   install_reminder; return 0 ;;
+        uninstall-reminder) uninstall_reminder; return 0 ;;
+    esac
+
     init_logging
     trap cleanup EXIT
     # Convert signals into a normal exit with the conventional code, so
@@ -1613,6 +1947,11 @@ main() {
             "$C_DIM" "run $TIMESTAMP" "$C_RESET" >&2
     else
         printf '\n=== USB Mirror Backup — run %s ===\n' "$TIMESTAMP" >&2
+    fi
+
+    if [[ "$MODE" == "init" ]]; then
+        init_stick
+        return 0
     fi
 
     local phases=5
@@ -1663,6 +2002,7 @@ main() {
     verify_all_sticks_identical
     write_manifests_to_all_sticks
     finalize_history
+    record_last_sync || print_warn "Could not record the last-sync time for reminders"
 
     # EXIT trap handles locking, summary, and final log line
 }

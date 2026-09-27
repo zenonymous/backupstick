@@ -37,8 +37,8 @@ setup() {
     export MOCK_STATE="${T}/state"
     export MOCK_VOLUMES="${T}/Volumes"
     export MOCK_PASSPHRASE="secret"
-    unset MOCK_UNLOCK_DELAY MOCK_LOCK_FAIL
-    mkdir -p "$MOCK_STATE" "$MOCK_VOLUMES" "${T}/src/docs" "${T}/src/keys"
+    unset MOCK_UNLOCK_DELAY MOCK_LOCK_FAIL MOCK_ENCRYPT_FAIL STDIN_INPUT PASS_OVERRIDE
+    mkdir -p "$MOCK_STATE/disks" "$MOCK_VOLUMES" "${T}/home" "${T}/src/docs" "${T}/src/keys"
     printf 'hello\n' > "${T}/src/docs/a.txt"
     printf 'world\n' > "${T}/src/docs/b.txt"
     printf 'k\n'     > "${T}/src/keys/id"
@@ -86,6 +86,7 @@ LABELS=(BACKUP_A BACKUP_B BACKUP_C BACKUP_D)
 MIN_STICKS_AVAILABLE=3
 ${SOURCES_LINE}
 LOG_DIR="${T}/logs"
+STATE_DIR="${T}/home/state"
 VOLUMES_ROOT="${MOCK_VOLUMES}"
 ${EXTRA_CONFIG}
 EOF
@@ -94,7 +95,9 @@ EOF
 run_backup() {
     # run_backup [args...]; sets OUT (stderr+stdout) and RC
     write_config
-    OUT="$(PATH="$TEST_PATH" USB_BACKUP_PASSPHRASE="${PASS_OVERRIDE:-secret}" \
+    # stdin: STDIN_INPUT (e.g. the --init-stick confirmation); never a TTY.
+    OUT="$(printf '%s\n' "${STDIN_INPUT:-}" | PATH="$TEST_PATH" HOME="${T}/home" \
+        USB_BACKUP_PASSPHRASE="${PASS_OVERRIDE:-secret}" \
         USB_BACKUP_CONFIG="${T}/test.conf" \
         "$BASH_UNDER_TEST" "$SCRIPT" --no-color "$@" 2>&1)"
     RC=$?

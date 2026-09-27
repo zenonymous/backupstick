@@ -10,7 +10,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: ShellCheck
-        run: shellcheck usb-mirror-backup.sh tests/*.sh tests/mocks/diskutil tests/mocks/linux/*
+        run: |
+          shellcheck usb-mirror-backup.sh tests/*.sh tests/mocks/diskutil tests/mocks/launchctl tests/mocks/osascript tests/mocks/linux/*
+          # config example is sourced by the script, so its variables look unused here
+          shellcheck -s bash -e SC2034 usb-backup.conf.example
 
   test-linux:
     runs-on: ubuntu-latest

@@ -3,8 +3,11 @@
 #   <LABEL>.present   stick is plugged in
 #   <LABEL>.data/     contents of the volume while locked
 # Unlocking moves <LABEL>.data to $MOCK_VOLUMES/<LABEL>; locking moves it back.
+#   disks/<diskN>     `diskutil info diskN` output for a whole disk (--init-stick)
+#   <LABEL>.encrypted passphrase given to encryptVolume
 # Knobs: MOCK_PASSPHRASE (expected passphrase), MOCK_UNLOCK_DELAY (seconds),
-#        MOCK_LOCK_FAIL=<LABEL> (lockVolume fails once for that label).
+#        MOCK_LOCK_FAIL=<LABEL> (lockVolume fails once for that label),
+#        MOCK_ENCRYPT_FAIL=1 (encryptVolume fails).
 set -u
 st="${MOCK_STATE:?}"
 vol="${MOCK_VOLUMES:?}"
@@ -14,6 +17,9 @@ label_of() { local l="${1#"$vol"/}"; printf '%s' "${l#/Volumes/}"; }
 
 case "${1:-}" in
     info)
+        if [[ "${2:-}" == disk* && -f "$st/disks/$2" ]]; then
+            cat "$st/disks/$2"; exit 0
+        fi
         l="$(label_of "${2:-}")"
         [[ -e "$st/$l.present" ]] || { echo "Could not find disk: $2" >&2; exit 1; }
         echo "   Volume Name:               $l"
@@ -38,8 +44,22 @@ case "${1:-}" in
                 [[ -d "$vol/$l" ]] || exit 1
                 mv "$vol/$l" "$st/$l.data"
                 ;;
+            encryptVolume)
+                pw="$(cat)"
+                [[ -z "${MOCK_ENCRYPT_FAIL:-}" ]] || exit 1
+                [[ -d "$vol/$l" ]] || exit 1
+                printf '%s' "$pw" > "$st/$l.encrypted"
+                ;;
             *) echo "mock diskutil: unsupported apfs verb $2" >&2; exit 1 ;;
         esac
+        ;;
+    eraseDisk)
+        # eraseDisk APFSX <LABEL> GPT <diskN>: new, mounted, unencrypted volume
+        [[ "${2:-}" == "APFSX" && "${4:-}" == "GPT" && -f "$st/disks/${5:-}" ]] || exit 1
+        touch "$st/$3.present"
+        rm -rf "${vol:?}/$3"
+        mkdir -p "$vol/$3"
+        echo "erased ${5} as $3" > "$st/${5}.erased"
         ;;
     unmount)
         # unmount force <mount>: pretend it worked
