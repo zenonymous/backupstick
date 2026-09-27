@@ -241,3 +241,247 @@ test_config_missing_file() {
     assert_rc 1
     assert_out "Config file not found"
 }
+
+# --- deletion guard, stale sources, source names (B) --------------------------
+
+make_many_files() {
+    local i
+    for (( i=1; i<=20; i++ )); do printf 'file %s\n' "$i" > "${T}/src/docs/f${i}.txt"; done
+}
+
+test_deletion_guard_blocks_mass_delete() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    make_many_files
+    run_backup
+    assert_rc 0
+    rm -f "${T}"/src/docs/f1*.txt "${T}"/src/docs/f2*.txt "${T}"/src/docs/f3.txt "${T}"/src/docs/f4.txt
+    run_backup
+    assert_rc 7
+    assert_out "Deletion guard"
+    assert_locked BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    assert_file "$(stick_dir BACKUP_A)/data/docs/f15.txt"
+    assert_file "$(stick_dir BACKUP_D)/data/docs/f15.txt"
+    assert_log "data/docs/f15.txt"
+}
+
+test_deletion_guard_override() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    make_many_files
+    run_backup
+    rm -f "${T}"/src/docs/f1*.txt
+    sleep 1
+    run_backup --allow-deletions
+    assert_rc 0
+    assert_out "overridden"
+    assert_no_file "$(stick_dir BACKUP_C)/data/docs/f15.txt"
+    # the deleted files survive in the snapshot
+    local snap
+    snap="$(find "$(stick_dir BACKUP_C)/history" -mindepth 1 -maxdepth 1 -type d | head -1)"
+    assert_file "${snap}/docs/f15.txt"
+}
+
+test_deletion_guard_dry_run_only_warns() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    make_many_files
+    run_backup
+    rm -f "${T}"/src/docs/f1*.txt
+    run_backup --dry-run
+    assert_rc 0
+    assert_out "a real run would stop here"
+}
+
+test_small_deletions_pass_guard() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    make_many_files
+    run_backup
+    rm -f "${T}/src/docs/f1.txt"
+    run_backup
+    assert_rc 0
+    assert_no_file "$(stick_dir BACKUP_B)/data/docs/f1.txt"
+}
+
+test_deletion_guard_disabled() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    make_many_files
+    run_backup
+    rm -f "${T}"/src/docs/f1*.txt
+    EXTRA_CONFIG="MAX_DELETE_PERCENT=0"
+    run_backup
+    assert_rc 0
+}
+
+test_removed_source_is_deleted_from_sticks() {
+    # KNOWN_ISSUES #8
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    run_backup
+    assert_file "$(stick_dir BACKUP_B)/data/keys/id"
+    SOURCES_LINE="SOURCES=( \"${T}/src/docs\" )"
+    run_backup
+    assert_rc 0
+    assert_out "no longer in SOURCES"
+    local l
+    for l in BACKUP_A BACKUP_B BACKUP_C BACKUP_D; do
+        assert_no_file "$(stick_dir "$l")/data/keys"
+    done
+}
+
+test_missing_source_is_kept_on_sticks() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    run_backup
+    mv "${T}/src/keys" "${T}/keys-away"
+    run_backup
+    assert_rc 0
+    assert_out "Source does not exist, skipping"
+    assert_file "$(stick_dir BACKUP_C)/data/keys/id"
+}
+
+test_duplicate_source_basenames_refused() {
+    # KNOWN_ISSUES #9
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    mkdir -p "${T}/other/docs"
+    SOURCES_LINE="SOURCES=( \"${T}/src/docs\" \"${T}/other/docs\" )"
+    run_backup
+    assert_rc 1
+    assert_out "would both be stored as data/docs"
+}
+
+test_trailing_slash_source() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    SOURCES_LINE="SOURCES=( \"${T}/src/docs/\" \"${T}/src/keys\" )"
+    run_backup
+    assert_rc 0
+    assert_file "$(stick_dir BACKUP_A)/data/docs/a.txt"
+    assert_no_file "$(stick_dir BACKUP_A)/data/a.txt"
+}
+
+test_single_file_source() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    printf 'seed\n' > "${T}/seed.gpg"
+    SOURCES_LINE="SOURCES=( \"${T}/src/docs\" \"${T}/seed.gpg\" )"
+    run_backup
+    assert_rc 0
+    assert_same_file "${T}/seed.gpg" "$(stick_dir BACKUP_D)/data/seed.gpg"
+    run_backup
+    assert_rc 0
+    assert_file "$(stick_dir BACKUP_D)/data/seed.gpg"
+}
+
+# --- history (B) --------------------------------------------------------------
+
+snapshot_count() {
+    local d
+    d="$(stick_dir "$1")/history"
+    [[ -d "$d" ]] || { echo 0; return; }
+    find "$d" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' '
+}
+
+test_history_snapshot_keeps_old_version() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    run_backup
+    assert_rc 0
+    [[ "$(snapshot_count BACKUP_A)" -eq 0 ]] || fail "first run on empty sticks should not snapshot"
+    printf 'version 2\n' > "${T}/src/docs/a.txt"
+    sleep 1
+    run_backup
+    assert_rc 0
+    local l snap
+    for l in BACKUP_A BACKUP_B BACKUP_C BACKUP_D; do
+        [[ "$(snapshot_count "$l")" -eq 1 ]] || fail "$l should have 1 snapshot"
+        snap="$(find "$(stick_dir "$l")/history" -mindepth 1 -maxdepth 1 -type d)"
+        grep -q hello "${snap}/docs/a.txt" || fail "$l snapshot lacks old version"
+        grep -q 'version 2' "$(stick_dir "$l")/data/docs/a.txt" || fail "$l data not updated"
+    done
+}
+
+test_history_unchanged_run_keeps_no_snapshot() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    run_backup
+    sleep 1
+    run_backup
+    assert_rc 0
+    [[ "$(snapshot_count BACKUP_A)" -eq 0 ]] || fail "unchanged run should not keep a snapshot"
+}
+
+test_history_pruned_to_keep() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    EXTRA_CONFIG="HISTORY_KEEP=2"
+    local i
+    for i in 1 2 3 4; do
+        printf 'v%s\n' "$i" > "${T}/src/docs/a.txt"
+        run_backup
+        assert_rc 0
+        sleep 1
+    done
+    [[ "$(snapshot_count BACKUP_B)" -eq 2 ]] || fail "expected 2 snapshots, got $(snapshot_count BACKUP_B)"
+}
+
+test_history_disabled() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    EXTRA_CONFIG="HISTORY_KEEP=0"
+    run_backup
+    printf 'v2\n' > "${T}/src/docs/a.txt"
+    run_backup
+    assert_rc 0
+    assert_no_file "$(stick_dir BACKUP_A)/history"
+}
+
+# --- stored hashes and --verify-only (C) -------------------------------------
+
+test_hashes_file_written_and_checkable() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    run_backup
+    assert_rc 0
+    local d
+    d="$(stick_dir BACKUP_C)"
+    assert_file "${d}/BACKUP_HASHES.txt"
+    ( cd "$d" && PATH="$TEST_PATH" shasum -a 256 -c BACKUP_HASHES.txt >/dev/null ) \
+        || fail "shasum -c BACKUP_HASHES.txt failed on the stick"
+    grep -q '^File hashes:' "${d}/BACKUP_MANIFEST.txt" || fail "manifest lacks File hashes line"
+}
+
+test_verify_only_ok() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    run_backup
+    SOURCES_LINE="SOURCES=()"
+    run_backup --verify-only
+    assert_rc 0
+    assert_out "Verification Complete"
+    assert_out "BACKUP_D: 3 files match"
+    assert_locked BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+}
+
+test_verify_only_detects_bitrot_on_single_stick() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    run_backup
+    corrupt_file_keep_size_mtime "$(stick_dir BACKUP_D)/data/docs/a.txt"
+    unplug BACKUP_A; unplug BACKUP_B; unplug BACKUP_C
+    run_backup --verify-only
+    assert_rc 3
+    assert_out "BACKUP_D: 1 file(s) changed, missing or added"
+    assert_unlocked BACKUP_D
+    assert_log "data/docs/a.txt"
+}
+
+test_verify_only_without_stored_hashes() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    run_backup
+    rm -f "$(stick_dir BACKUP_A)/BACKUP_HASHES.txt" "$(stick_dir BACKUP_B)/BACKUP_HASHES.txt" \
+          "$(stick_dir BACKUP_C)/BACKUP_HASHES.txt" "$(stick_dir BACKUP_D)/BACKUP_HASHES.txt"
+    run_backup --verify-only
+    assert_rc 2
+    assert_out "older version"
+    assert_locked BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+}
+
+test_verify_only_writes_nothing() {
+    make_sticks BACKUP_A BACKUP_B BACKUP_C BACKUP_D
+    run_backup
+    local before
+    before="$(cat "$(stick_dir BACKUP_A)/BACKUP_MANIFEST.txt")"
+    printf 'changed\n' > "${T}/src/docs/a.txt"
+    sleep 1
+    run_backup --verify-only
+    assert_rc 0
+    [[ "$before" == "$(cat "$(stick_dir BACKUP_A)/BACKUP_MANIFEST.txt")" ]] || fail "manifest changed"
+    grep -q hello "$(stick_dir BACKUP_A)/data/docs/a.txt" || fail "data changed"
+}

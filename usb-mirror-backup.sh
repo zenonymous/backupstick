@@ -16,7 +16,10 @@
 # Usage: ./usb-mirror-backup.sh                     # all sticks required
 #        ./usb-mirror-backup.sh --dry-run           # no writes
 #        ./usb-mirror-backup.sh --available-only    # ≥MIN_STICKS_AVAILABLE present
+#        ./usb-mirror-backup.sh --verify-only       # check sticks against stored hashes
+#        ./usb-mirror-backup.sh --allow-deletions   # bypass the deletion guard once
 #        ./usb-mirror-backup.sh --no-color          # disable colored output
+#        ./usb-mirror-backup.sh --config FILE       # settings file
 #        ./usb-mirror-backup.sh --help
 #
 # Exit codes:
@@ -27,6 +30,7 @@
 #   4  canary integrity failure
 #   5  unlock / mount problem
 #   6  rsync fatal error
+#   7  deletion guard tripped (nothing was changed)
 #
 
 set -Eeuo pipefail
@@ -98,6 +102,24 @@ VOLUMES_ROOT="/Volumes"
 #   PRE_BACKUP_HOOK="osascript ${HOME}/bin/export-notes.scpt"
 PRE_BACKUP_HOOK=""
 
+# Deletion guard. Before writing anything, the script works out how many
+# backed-up files this run would delete on each stick. If that is more than
+# MAX_DELETE_MIN files AND more than MAX_DELETE_PERCENT % of the files on
+# that stick, it stops (exit 7) without changing anything. This protects
+# against a wiped or ransomware-encrypted source being mirrored to every
+# stick. --allow-deletions overrides it for one run. MAX_DELETE_PERCENT=0
+# disables the guard.
+MAX_DELETE_PERCENT=25
+MAX_DELETE_MIN=10
+
+# History. Before a run changes a stick, its data/ is snapshotted to
+# <volume>/history/<UTC timestamp>/ using hard links, so unchanged files take
+# no extra space. A snapshot is dropped again if the run changed nothing.
+# The newest HISTORY_KEEP snapshots are kept per stick. 0 disables snapshots
+# (existing history/ is then left alone).
+HISTORY_KEEP=8
+HISTORY_SUBDIR="history"
+
 # =============================================================================
 # END CONFIGURATION  —  don't edit below unless you know what you're doing
 # =============================================================================
@@ -105,6 +127,8 @@ PRE_BACKUP_HOOK=""
 # Runtime state
 DRY_RUN=0
 AVAILABLE_ONLY=0
+VERIFY_ONLY=0
+ALLOW_DELETIONS=0
 NO_COLOR=0
 CONFIG_FILE=""
 PRESENT_LABELS=()
@@ -117,8 +141,11 @@ SCRIPT_PATH=""
 SCRIPT_HASH=""
 PASSPHRASE=""
 HASHER_CMD=()
+HASHER_FORCED=()
 RSYNC_PROGRESS_FLAGS=()
-VERIFY_WORKDIR=""
+FIND_ARGS=()
+WORKDIR=""
+SNAPSHOT_LABELS=()
 VERIFIED_HUB_HASHES=""
 START_EPOCH=0
 SUMMARY_FILE_COUNT=""
@@ -297,10 +324,14 @@ print_summary() {
     duration_sec=$(( $(date +%s) - START_EPOCH ))
 
     local status_icon status_text status_color
+    local what="Backup"
+    if [[ "$VERIFY_ONLY" -eq 1 ]]; then
+        what="Verification"
+    fi
     if [[ "$status" == "success" ]]; then
-        status_icon="✓"; status_text="Backup Complete"; status_color="$C_GREEN"
+        status_icon="✓"; status_text="${what} Complete"; status_color="$C_GREEN"
     else
-        status_icon="✗"; status_text="Backup Failed";   status_color="$C_RED"
+        status_icon="✗"; status_text="${what} Failed";   status_color="$C_RED"
     fi
 
     local sep="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -315,7 +346,12 @@ print_summary() {
         fi
 
         printf '  %-18s %s\n' "Hub"       "$HUB_LABEL"
-        printf '  %-18s %s\n' "$([[ "$status" == "success" ]] && echo Synced || echo Sticks)" \
+        local sticks_title="Sticks"
+        if [[ "$status" == "success" ]]; then
+            sticks_title="Synced"
+            [[ "$VERIFY_ONLY" -eq 1 ]] && sticks_title="Checked"
+        fi
+        printf '  %-18s %s\n' "$sticks_title" \
             "$(join_by "${PRESENT_LABELS[@]}")"
         if [[ "${#MISSING_LABELS[@]}" -gt 0 ]]; then
             printf '  %-18s %s\n' "Missing" "$(join_by "${MISSING_LABELS[@]}")"
@@ -348,6 +384,13 @@ Options:
                      (minimum MIN_STICKS_AVAILABLE, default 3). Without
                      this flag, ALL configured sticks must be present.
                      Intended for offsite rotation workflows.
+  --verify-only      Don't back up. Unlock the present sticks and check
+                     every file against the hashes stored on that stick by
+                     the last backup (detects bit-rot, e.g. on the offsite
+                     stick). Any number of sticks may be present.
+  --allow-deletions  Run even if the deletion guard (MAX_DELETE_PERCENT /
+                     MAX_DELETE_MIN) would stop it. Use after checking that
+                     the deletions are intended.
   --no-color         Disable colored output and animations.
   --config FILE      Read settings from FILE (default: $USB_BACKUP_CONFIG,
                      else ~/.config/usb-backup/config if it exists).
@@ -571,7 +614,23 @@ verify_canaries_match() {
 # Hashing with live progress bar
 # -----------------------------------------------------------------------------
 
+set_find_args() {
+    # FIND_ARGS = prune RSYNC_EXCLUDES, then match regular files with the
+    # given action (-print or -print0). Shared by every file listing so that
+    # counting, hashing and deletion planning see the same set of files.
+    local action="$1" excl
+    FIND_ARGS=()
+    for excl in "${RSYNC_EXCLUDES[@]}"; do
+        FIND_ARGS+=( "-name" "$excl" "-prune" "-o" )
+    done
+    FIND_ARGS+=( "-type" "f" "$action" )
+}
+
 pick_hasher_cmd() {
+    if [[ "${#HASHER_FORCED[@]}" -gt 0 ]]; then
+        HASHER_CMD=( "${HASHER_FORCED[@]}" )
+        return 0
+    fi
     if command -v b3sum >/dev/null 2>&1; then
         HASHER_CMD=( b3sum )
     else
@@ -613,13 +672,6 @@ generate_file_manifest() {
         die 2 "Data directory missing: ${data_root}"
     fi
 
-    local find_args=()
-    local excl
-    for excl in "${RSYNC_EXCLUDES[@]}"; do
-        find_args+=( "-name" "$excl" "-prune" "-o" )
-    done
-    find_args+=( "-type" "f" "-print0" )
-
     # Pre-count for progress bar
     local total
     total=$(count_files_under_data "$root")
@@ -631,9 +683,10 @@ generate_file_manifest() {
     fi
 
     # Pipe: find | sort | hash-batches → tee to output file → progress counter
+    set_find_args -print0
     (
         cd "$root"
-        find "$DATA_SUBDIR" ${find_args[@]+"${find_args[@]}"} \
+        find "$DATA_SUBDIR" "${FIND_ARGS[@]}" \
             | LC_ALL=C sort -z \
             | xargs -0 -n 32 "${HASHER_CMD[@]}"
     ) | tee "$out" | progress_counter "$total" "hashing ${label}"
@@ -794,9 +847,7 @@ mirror_hub_to_secondaries() {
 verify_all_sticks_identical() {
     # Generate hash manifest per present stick, compare all secondaries
     # against the hub. On any mismatch: log diff and abort (exit 3).
-    local workdir
-    workdir="$(mktemp -d -t usb-mirror-verify)"
-    VERIFY_WORKDIR="$workdir"
+    local workdir="$WORKDIR"
 
     log "Hashing ${#PRESENT_LABELS[@]} stick(s) for verification"
     local label
@@ -883,14 +934,26 @@ write_backup_manifest() {
         printf 'Total bytes:       %s\n' "$total_bytes"
         printf 'Root hash:         sha256:%s\n' "$root_hash"
         printf 'Canary SHA:        sha256:%s\n' "$canary_hash"
+        printf 'File hashes:       BACKUP_HASHES.txt (check: cd <volume> && %s -c BACKUP_HASHES.txt)\n' "$(hasher_name)"
+        if [[ "$HISTORY_KEEP" -gt 0 ]]; then
+            printf 'History:           %s/ (newest %s snapshots kept)\n' "$HISTORY_SUBDIR" "$HISTORY_KEEP"
+        else
+            printf 'History:           disabled\n'
+        fi
     } > "$tmp"
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        log "[dry-run] would write manifest to ${manifest}"
-    else
-        mv "$tmp" "$manifest"
+        log "[dry-run] would write manifest and hashes to ${mount}"
+        rm -f "$tmp"
+        return 0
     fi
-    rm -f "$tmp"
+    mv "$tmp" "$manifest"
+
+    # Per-file hashes, so a single stick can be checked on its own later
+    # (--verify-only, or by hand with the command shown in the manifest).
+    local hashes_tmp="${mount}/.BACKUP_HASHES.txt.tmp"
+    cp "$VERIFIED_HUB_HASHES" "$hashes_tmp"
+    mv "$hashes_tmp" "${mount}/BACKUP_HASHES.txt"
 }
 
 write_manifests_to_all_sticks() {
@@ -919,21 +982,15 @@ write_manifests_to_all_sticks() {
 
 count_files_under_data() {
     local mount="$1"
-    local find_args=()
-    local excl
-    for excl in "${RSYNC_EXCLUDES[@]}"; do
-        find_args+=( "-name" "$excl" "-prune" "-o" )
-    done
-    find_args+=( "-type" "f" "-print0" )
-
     if [[ ! -d "${mount}/${DATA_SUBDIR}" ]]; then
         printf '0'
         return 0
     fi
 
+    set_find_args -print0
     (
         cd "$mount"
-        find "$DATA_SUBDIR" ${find_args[@]+"${find_args[@]}"} | tr -cd '\0' | wc -c | tr -d ' '
+        find "$DATA_SUBDIR" "${FIND_ARGS[@]}" | tr -cd '\0' | wc -c | tr -d ' '
     )
 }
 
@@ -950,6 +1007,334 @@ bytes_under_data() {
 
 root_hash_of_manifest() {
     shasum -a 256 "$1" | awk '{print $1}'
+}
+
+# -----------------------------------------------------------------------------
+# Sources, deletion guard, history
+# -----------------------------------------------------------------------------
+
+source_basename() {
+    local s="$1"
+    printf '%s' "${s##*/}"
+}
+
+normalize_sources() {
+    # "dir/" and "dir" must behave the same: without this, rsync would copy
+    # the *contents* of "dir/" straight into data/.
+    local i
+    for (( i=0; i<${#SOURCES[@]}; i++ )); do
+        while [[ "${SOURCES[$i]}" == */ && "${SOURCES[$i]}" != "/" ]]; do
+            SOURCES[i]="${SOURCES[$i]%/}"
+        done
+    done
+}
+
+check_source_names() {
+    # Every source lands in data/<basename>. Two sources with the same
+    # basename would overwrite each other on every run.
+    local i j bi bj
+    for (( i=0; i<${#SOURCES[@]}; i++ )); do
+        bi="$(source_basename "${SOURCES[$i]}")"
+        if [[ -z "$bi" || "$bi" == "." || "$bi" == ".." ]]; then
+            die 1 "Unsupported source path: '${SOURCES[$i]}' (needs a real file or directory name)"
+        fi
+        for (( j=i+1; j<${#SOURCES[@]}; j++ )); do
+            bj="$(source_basename "${SOURCES[$j]}")"
+            if [[ "$bi" == "$bj" ]]; then
+                die 1 "Sources '${SOURCES[$i]}' and '${SOURCES[$j]}' would both be stored as ${DATA_SUBDIR}/${bi}. Rename one or back up a parent directory instead."
+            fi
+        done
+    done
+}
+
+check_layout_config() {
+    local name
+    for name in "$DATA_SUBDIR" "$HISTORY_SUBDIR"; do
+        if [[ -z "$name" || "$name" == *"/"* || "$name" == "." || "$name" == ".." ]]; then
+            die 1 "DATA_SUBDIR and HISTORY_SUBDIR must be plain directory names (got '${name}')"
+        fi
+    done
+    if [[ "$DATA_SUBDIR" == "$HISTORY_SUBDIR" ]]; then
+        die 1 "DATA_SUBDIR and HISTORY_SUBDIR must differ"
+    fi
+    case "$HISTORY_KEEP$MAX_DELETE_PERCENT$MAX_DELETE_MIN" in
+        *[!0-9]*) die 1 "HISTORY_KEEP, MAX_DELETE_PERCENT and MAX_DELETE_MIN must be whole numbers" ;;
+    esac
+}
+
+is_configured_source_name() {
+    local name="$1" src
+    for src in "${SOURCES[@]}"; do
+        if [[ "$(source_basename "$src")" == "$name" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+list_data_files() {
+    # Sorted relative paths ("data/...") of backed-up files on a volume.
+    local mount="$1"
+    [[ -d "${mount}/${DATA_SUBDIR}" ]] || return 0
+    set_find_args -print
+    ( cd "$mount" && find "$DATA_SUBDIR" "${FIND_ARGS[@]}" ) | LC_ALL=C sort
+}
+
+plan_expected_files() {
+    # Write the sorted list of files that data/ will contain after this run:
+    # every file of every existing source, plus whatever the hub already has
+    # for sources that are configured but currently missing (those are kept).
+    local out="$1" hub_list="$2"
+    local src base parent
+    : > "$out"
+    set_find_args -print
+    for src in "${SOURCES[@]}"; do
+        base="$(source_basename "$src")"
+        if [[ -d "$src" && ! -L "$src" ]]; then
+            parent="$(dirname "$src")"
+            ( cd "$parent" && find "$base" "${FIND_ARGS[@]}" ) \
+                | awk -v p="${DATA_SUBDIR}/" '{ print p $0 }' >> "$out"
+        elif [[ -f "$src" && ! -L "$src" ]]; then
+            printf '%s/%s\n' "$DATA_SUBDIR" "$base" >> "$out"
+        elif [[ ! -e "$src" ]]; then
+            awk -v pre="${DATA_SUBDIR}/${base}/" -v exact="${DATA_SUBDIR}/${base}" \
+                'index($0, pre) == 1 || $0 == exact' "$hub_list" >> "$out"
+        fi
+    done
+    LC_ALL=C sort -o "$out" "$out"
+}
+
+deletion_guard_trips() {
+    local n_del="$1" n_total="$2"
+    [[ "$MAX_DELETE_PERCENT" -gt 0 ]] || return 1
+    [[ "$n_del" -gt "$MAX_DELETE_MIN" ]] || return 1
+    [[ $(( n_del * 100 )) -gt $(( MAX_DELETE_PERCENT * n_total )) ]]
+}
+
+check_deletion_guard() {
+    # Runs before anything is written. Compares each present stick's data/
+    # with what it will hold after this run and stops (exit 7) if too much
+    # would disappear.
+    local hub_list="${WORKDIR}/${HUB_LABEL}.before.files"
+    local expected="${WORKDIR}/expected.files"
+    list_data_files "$(mount_point_for "$HUB_LABEL")" > "$hub_list"
+    plan_expected_files "$expected" "$hub_list"
+
+    local label before dels n_del n_total total_del=0
+    local tripped=()
+    for label in "${PRESENT_LABELS[@]}"; do
+        before="${WORKDIR}/${label}.before.files"
+        if [[ "$label" != "$HUB_LABEL" ]]; then
+            list_data_files "$(mount_point_for "$label")" > "$before"
+        fi
+        dels="${WORKDIR}/${label}.deletions"
+        LC_ALL=C comm -23 "$before" "$expected" > "$dels"
+        n_del="$(wc -l < "$dels" | tr -d ' ')"
+        n_total="$(wc -l < "$before" | tr -d ' ')"
+        total_del=$(( total_del + n_del ))
+        if [[ "$n_del" -gt 0 ]]; then
+            log "${label}: this run deletes ${n_del} of ${n_total} file(s)"
+            {
+                printf -- '--- Files to delete on %s (first 100) ---\n' "$label"
+                head -100 "$dels"
+            } >> "$LOG_FILE"
+        fi
+        if deletion_guard_trips "$n_del" "$n_total"; then
+            tripped+=("$label")
+            print_fail "${label}: this run would delete ${n_del} of ${n_total} files ($(( n_del * 100 / n_total ))%)"
+        fi
+    done
+
+    if [[ "${#tripped[@]}" -eq 0 ]]; then
+        print_ok "Deletion check passed (${total_del} file deletion(s) across all sticks)"
+        return 0
+    fi
+    if [[ "$ALLOW_DELETIONS" -eq 1 ]]; then
+        print_warn "Deletion guard overridden by --allow-deletions"
+        return 0
+    fi
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        print_warn "[dry-run] a real run would stop here (deletion guard); see the log for the file list"
+        return 0
+    fi
+    die 7 "Deletion guard: too many files would be deleted on $(join_by "${tripped[@]}") (limit: more than ${MAX_DELETE_MIN} files and ${MAX_DELETE_PERCENT}%). Nothing was changed. Check your sources; the file list is in the log. If this is intended, re-run with --allow-deletions."
+}
+
+remove_stale_sources() {
+    # rsync --delete only works inside data/<source>, so a source that was
+    # removed from SOURCES would otherwise stay on the sticks forever.
+    # Entries for configured sources that are temporarily missing are kept.
+    local data_root
+    data_root="$(mount_point_for "$HUB_LABEL")/${DATA_SUBDIR}"
+    [[ -d "$data_root" ]] || return 0
+
+    local entry name excl skip
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        name="${entry##*/}"
+        skip=0
+        for excl in "${RSYNC_EXCLUDES[@]}"; do
+            # shellcheck disable=SC2053  # glob match against exclude pattern is intended
+            if [[ "$name" == $excl ]]; then
+                skip=1
+            fi
+        done
+        [[ "$skip" -eq 0 ]] || continue
+        is_configured_source_name "$name" && continue
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            print_warn "[dry-run] would remove ${DATA_SUBDIR}/${name} (no longer in SOURCES)"
+        else
+            print_warn "Removing ${DATA_SUBDIR}/${name} from hub ${HUB_LABEL} (no longer in SOURCES)"
+            log_to_file "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] removing stale source ${entry}"
+            rm -rf "$entry"
+        fi
+    done <<EOF
+$(find "$data_root" -mindepth 1 -maxdepth 1 -print)
+EOF
+}
+
+snapshot_sticks() {
+    # Hard-link copy of each stick's current data/ into history/<timestamp>/
+    # before anything is changed. Files updated later by rsync get a new inode
+    # (rsync writes a temp file and renames it), so the snapshot keeps the old
+    # content. Also saves each stick's previous BACKUP_HASHES.txt so an
+    # unchanged run can drop its snapshot again.
+    local label mount data dest
+    for label in "${PRESENT_LABELS[@]}"; do
+        mount="$(mount_point_for "$label")"
+        if [[ -f "${mount}/BACKUP_HASHES.txt" ]]; then
+            cp "${mount}/BACKUP_HASHES.txt" "${WORKDIR}/${label}.prev.hashes"
+        fi
+    done
+
+    [[ "$HISTORY_KEEP" -gt 0 ]] || return 0
+
+    local excludes=()
+    # shellcheck disable=SC2207
+    excludes=( $(build_rsync_excludes) )
+
+    for label in "${PRESENT_LABELS[@]}"; do
+        mount="$(mount_point_for "$label")"
+        data="${mount}/${DATA_SUBDIR}"
+        [[ -s "${WORKDIR}/${label}.before.files" ]] || continue
+        dest="${mount}/${HISTORY_SUBDIR}/${TIMESTAMP}"
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            log "[dry-run] would snapshot ${label}:${DATA_SUBDIR}/ to ${HISTORY_SUBDIR}/${TIMESTAMP}"
+            continue
+        fi
+        mkdir -p "${mount}/${HISTORY_SUBDIR}"
+        if ! rsync -a --link-dest="$data" "${excludes[@]}" "${data}/" "${dest}/" >>"$LOG_FILE" 2>&1; then
+            die 6 "Snapshot of ${label} to ${dest} failed"
+        fi
+        SNAPSHOT_LABELS+=("$label")
+    done
+    if [[ "${#SNAPSHOT_LABELS[@]}" -gt 0 ]]; then
+        print_ok "Snapshot ${HISTORY_SUBDIR}/${TIMESTAMP} taken on $(join_by "${SNAPSHOT_LABELS[@]}")"
+    fi
+}
+
+finalize_history() {
+    # After a verified run: drop snapshots of sticks that didn't change, then
+    # keep only the newest HISTORY_KEEP snapshots per stick.
+    [[ "$HISTORY_KEEP" -gt 0 && "$DRY_RUN" -eq 0 ]] || return 0
+
+    local label mount prev
+    for label in ${SNAPSHOT_LABELS[@]+"${SNAPSHOT_LABELS[@]}"}; do
+        mount="$(mount_point_for "$label")"
+        prev="${WORKDIR}/${label}.prev.hashes"
+        if [[ -f "$prev" ]] && cmp -s "$prev" "$VERIFIED_HUB_HASHES"; then
+            rm -rf "${mount:?}/${HISTORY_SUBDIR:?}/${TIMESTAMP:?}"
+            log "${label}: nothing changed, snapshot not kept"
+        fi
+    done
+
+    local hist snaps n remove snap
+    for label in "${PRESENT_LABELS[@]}"; do
+        hist="$(mount_point_for "$label")/${HISTORY_SUBDIR}"
+        [[ -d "$hist" ]] || continue
+        snaps="$(find "$hist" -mindepth 1 -maxdepth 1 -type d \
+            -name '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z' -print | LC_ALL=C sort)"
+        [[ -n "$snaps" ]] || continue
+        n="$(printf '%s\n' "$snaps" | wc -l | tr -d ' ')"
+        remove=$(( n - HISTORY_KEEP ))
+        [[ "$remove" -gt 0 ]] || continue
+        while IFS= read -r snap; do
+            log "${label}: pruning old snapshot ${snap##*/}"
+            rm -rf "$snap"
+        done <<EOF
+$(printf '%s\n' "$snaps" | head -n "$remove")
+EOF
+    done
+}
+
+# -----------------------------------------------------------------------------
+# --verify-only: check each stick against its own stored hashes
+# -----------------------------------------------------------------------------
+
+manifest_field() {
+    # manifest_field FILE "Hasher" -> value after "Hasher:"
+    local file="$1" key="$2"
+    [[ -f "$file" ]] || return 0
+    awk -v k="${key}:" 'index($0, k) == 1 { sub(/^[^:]*:[ \t]*/, ""); print; exit }' "$file"
+}
+
+use_hasher_named() {
+    case "$1" in
+        b3sum)
+            require_tool b3sum
+            HASHER_FORCED=( b3sum )
+            ;;
+        "shasum -a 256"|"")
+            HASHER_FORCED=( shasum -a 256 )
+            ;;
+        *)
+            die 1 "Unknown hasher '$1' in BACKUP_MANIFEST.txt"
+            ;;
+    esac
+}
+
+verify_stored_hashes() {
+    local label mount stored now hasher run n_bad
+    local bad=() checked=() runs=()
+    for label in "${PRESENT_LABELS[@]}"; do
+        mount="$(mount_point_for "$label")"
+        stored="${mount}/BACKUP_HASHES.txt"
+        if [[ ! -f "$stored" ]]; then
+            print_warn "${label}: no BACKUP_HASHES.txt (last backed up by an older version of this script), skipped"
+            continue
+        fi
+        hasher="$(manifest_field "${mount}/BACKUP_MANIFEST.txt" "Hasher")"
+        run="$(manifest_field "${mount}/BACKUP_MANIFEST.txt" "Backup run")"
+        use_hasher_named "$hasher"
+        now="${WORKDIR}/${label}.now.hashes"
+        generate_file_manifest "$mount" "$now" "$label"
+        checked+=("$label")
+        runs+=("${label}=${run:-unknown}")
+        if cmp -s "$stored" "$now"; then
+            print_ok "${label}: $(format_number "$(wc -l < "$now" | tr -d ' ')") files match the hashes stored by backup ${run:-?}"
+            continue
+        fi
+        bad+=("$label")
+        n_bad="$( { diff "$stored" "$now" || true; } \
+            | awk '/^[<>] / { sub(/^[<>] [^ ]+ [ *]?/, ""); if (!seen[$0]++) n++ } END { print n + 0 }')"
+        print_fail "${label}: ${n_bad} file(s) changed, missing or added since backup ${run:-?} (details in log)"
+        {
+            printf '\n--- %s: stored hashes vs now (first 50 lines) ---\n' "$label"
+            { diff "$stored" "$now" || true; } | head -50
+        } >> "$LOG_FILE"
+    done
+
+    if [[ "${#checked[@]}" -eq 0 ]]; then
+        die 2 "No present stick has stored hashes yet. Run a normal backup first."
+    fi
+    log "Last backup per stick: $(join_by "${runs[@]}")"
+    SUMMARY_FILE_COUNT="$(wc -l < "${WORKDIR}/${checked[0]}.now.hashes" | tr -d ' ')"
+    SUMMARY_TOTAL_BYTES="$(bytes_under_data "$(mount_point_for "${checked[0]}")")"
+
+    if [[ "${#bad[@]}" -gt 0 ]]; then
+        log "Mismatches: $(join_by "${bad[@]}")"
+        exit 3
+    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -1020,8 +1405,8 @@ cleanup() {
             done
             log "Lock manually when done: ${lock_cmds}"
         fi
-        if [[ -n "${VERIFY_WORKDIR}" && -d "${VERIFY_WORKDIR}" ]]; then
-            rm -rf "$VERIFY_WORKDIR"
+        if [[ -n "${WORKDIR}" && -d "${WORKDIR}" ]]; then
+            rm -rf "$WORKDIR"
         fi
         print_summary "failure"
         exit "$rc"
@@ -1035,8 +1420,8 @@ cleanup() {
         done
     fi
 
-    if [[ -n "${VERIFY_WORKDIR}" && -d "${VERIFY_WORKDIR}" ]]; then
-        rm -rf "$VERIFY_WORKDIR"
+    if [[ -n "${WORKDIR}" && -d "${WORKDIR}" ]]; then
+        rm -rf "$WORKDIR"
     fi
 
     if [[ "$rc" -eq 0 ]]; then
@@ -1059,6 +1444,8 @@ parse_args() {
         case "$1" in
             --dry-run) DRY_RUN=1 ;;
             --available-only) AVAILABLE_ONLY=1 ;;
+            --verify-only) VERIFY_ONLY=1 ;;
+            --allow-deletions) ALLOW_DELETIONS=1 ;;
             --no-color) NO_COLOR=1 ;;
             --config)
                 [[ $# -ge 2 ]] || { usage >&2; die 1 "--config needs a file path"; }
@@ -1141,11 +1528,16 @@ preflight() {
 
     detect_rsync_capabilities
 
-    if [[ "${#SOURCES[@]}" -eq 0 ]]; then
-        die 1 "SOURCES array is empty. Edit the config in $0 and add source paths."
-    fi
     if [[ "${#LABELS[@]}" -lt 2 ]]; then
         die 1 "LABELS must contain at least 2 sticks for mirror semantics."
+    fi
+    check_layout_config
+    if [[ "$VERIFY_ONLY" -eq 0 ]]; then
+        if [[ "${#SOURCES[@]}" -eq 0 ]]; then
+            die 1 "SOURCES array is empty. Add source paths to your config file (see usb-backup.conf.example)."
+        fi
+        normalize_sources
+        check_source_names
     fi
 
     detect_present_sticks
@@ -1154,7 +1546,12 @@ preflight() {
         die 2 "None of the configured sticks are present: $(join_by "${LABELS[@]}")"
     fi
 
-    if [[ "$AVAILABLE_ONLY" -eq 0 ]]; then
+    if [[ "$VERIFY_ONLY" -eq 1 ]]; then
+        # Checking needs no redundancy: any present stick can be verified.
+        if [[ "${#MISSING_LABELS[@]}" -gt 0 ]]; then
+            print_warn "Not present (not checked): $(join_by "${MISSING_LABELS[@]}")"
+        fi
+    elif [[ "$AVAILABLE_ONLY" -eq 0 ]]; then
         if [[ "${#MISSING_LABELS[@]}" -gt 0 ]]; then
             die 2 "Not all configured sticks present. Missing: $(join_by "${MISSING_LABELS[@]}"). Use --available-only to work with $(join_by "${PRESENT_LABELS[@]}")."
         fi
@@ -1218,22 +1615,34 @@ main() {
         printf '\n=== USB Mirror Backup — run %s ===\n' "$TIMESTAMP" >&2
     fi
 
-    print_phase 1 5 "Preflight & detection"
+    local phases=5
+    if [[ "$VERIFY_ONLY" -eq 1 ]]; then
+        phases=4
+    fi
+
+    print_phase 1 "$phases" "Preflight & detection"
     preflight
+    WORKDIR="$(mktemp -d -t usb-mirror-backup)"
     prompt_passphrase
 
-    print_phase 2 5 "Unlocking volumes"
+    print_phase 2 "$phases" "Unlocking volumes"
     local label
     for label in "${PRESENT_LABELS[@]}"; do
         unlock_volume "$label"
     done
     PASSPHRASE=""
 
-    print_phase 3 5 "Integrity checks"
+    print_phase 3 "$phases" "Integrity checks"
     for label in "${PRESENT_LABELS[@]}"; do
         verify_canary "$label"
     done
     verify_canaries_match
+
+    if [[ "$VERIFY_ONLY" -eq 1 ]]; then
+        print_phase 4 "$phases" "Checking stored hashes"
+        verify_stored_hashes
+        return 0
+    fi
 
     if [[ "$DRY_RUN" -eq 0 ]]; then
         for label in "${PRESENT_LABELS[@]}"; do
@@ -1243,13 +1652,17 @@ main() {
 
     run_pre_hook
 
-    print_phase 4 5 "Syncing data"
+    print_phase 4 "$phases" "Syncing data"
+    check_deletion_guard
+    snapshot_sticks
+    remove_stale_sources
     sync_sources_to_hub
     mirror_hub_to_secondaries
 
-    print_phase 5 5 "Verification & manifests"
+    print_phase 5 "$phases" "Verification & manifests"
     verify_all_sticks_identical
     write_manifests_to_all_sticks
+    finalize_history
 
     # EXIT trap handles locking, summary, and final log line
 }

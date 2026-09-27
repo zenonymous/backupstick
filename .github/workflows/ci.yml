@@ -8,14 +8,14 @@ jobs:
   shellcheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: ShellCheck
         run: shellcheck usb-mirror-backup.sh tests/*.sh tests/mocks/diskutil tests/mocks/linux/*
 
   test-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Test suite (bash 5, GNU tools, rsync 3.x)
         run: tests/run-tests.sh
 
@@ -23,7 +23,7 @@ jobs:
     # The real target: /bin/bash 3.2, BSD tools, Apple's rsync.
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Tool versions
         run: |
           /bin/bash --version | head -1
