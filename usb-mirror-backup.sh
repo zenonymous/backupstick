@@ -29,11 +29,17 @@
 #   6  rsync fatal error
 #
 
-set -euo pipefail
+set -Eeuo pipefail
 IFS=$'\n\t'
 
 # =============================================================================
 # CONFIGURATION  —  user-tunable knobs
+#
+# These are defaults. Prefer putting your settings in a config file instead
+# of editing this script (keeps personal paths out of the repo):
+#   --config PATH, else $USB_BACKUP_CONFIG, else ~/.config/usb-backup/config
+# The file is sourced as bash and may override any variable below. See
+# usb-backup.conf.example.
 # =============================================================================
 
 # Volume labels, in order of preference for hub role. The first present label
@@ -84,6 +90,9 @@ RSYNC_EXCLUDES=(
 # Log directory
 LOG_DIR="${HOME}/Library/Logs/usb-backup"
 
+# Where macOS mounts volumes. Only change this for testing.
+VOLUMES_ROOT="/Volumes"
+
 # Optional pre-backup hook (e.g. export Apple Notes via osascript).
 # Leave empty for none. Example:
 #   PRE_BACKUP_HOOK="osascript ${HOME}/bin/export-notes.scpt"
@@ -97,6 +106,7 @@ PRE_BACKUP_HOOK=""
 DRY_RUN=0
 AVAILABLE_ONLY=0
 NO_COLOR=0
+CONFIG_FILE=""
 PRESENT_LABELS=()
 MISSING_LABELS=()
 UNLOCKED_LABELS=()
@@ -111,6 +121,9 @@ RSYNC_PROGRESS_FLAGS=()
 VERIFY_WORKDIR=""
 VERIFIED_HUB_HASHES=""
 START_EPOCH=0
+SUMMARY_FILE_COUNT=""
+SUMMARY_TOTAL_BYTES=""
+CLEANUP_DONE=0
 
 # TTY / color state
 IS_TTY=0
@@ -277,16 +290,10 @@ print_warn() { print_mark "⚠" "$C_YELLOW" "$1"; }
 print_fail() { print_mark "✗" "$C_RED"    "$1"; }
 
 print_summary() {
+    # Must not touch the sticks: on success they are already locked when this
+    # runs. File/size stats come from SUMMARY_* (set while still unlocked).
     local status="$1"   # "success" or "failure"
-    local hub_mount
-    hub_mount="$(mount_point_for "$HUB_LABEL")"
-
-    local file_count total_bytes duration_sec
-    if [[ -n "$VERIFIED_HUB_HASHES" && -f "${hub_mount}/${DATA_SUBDIR}" ]] 2>/dev/null; then
-        :
-    fi
-    file_count="$(count_files_under_data "$hub_mount" 2>/dev/null || echo 0)"
-    total_bytes="$(bytes_under_data "$hub_mount" 2>/dev/null || echo 0)"
+    local duration_sec
     duration_sec=$(( $(date +%s) - START_EPOCH ))
 
     local status_icon status_text status_color
@@ -308,12 +315,15 @@ print_summary() {
         fi
 
         printf '  %-18s %s\n' "Hub"       "$HUB_LABEL"
-        printf '  %-18s %s\n' "Synced"    "$(join_by "${PRESENT_LABELS[@]}")"
+        printf '  %-18s %s\n' "$([[ "$status" == "success" ]] && echo Synced || echo Sticks)" \
+            "$(join_by "${PRESENT_LABELS[@]}")"
         if [[ "${#MISSING_LABELS[@]}" -gt 0 ]]; then
             printf '  %-18s %s\n' "Missing" "$(join_by "${MISSING_LABELS[@]}")"
         fi
-        printf '  %-18s %s\n' "Files"     "$(format_number "$file_count")"
-        printf '  %-18s %s\n' "Size"      "$(format_bytes "$total_bytes")"
+        if [[ -n "$SUMMARY_FILE_COUNT" ]]; then
+            printf '  %-18s %s\n' "Files" "$(format_number "$SUMMARY_FILE_COUNT")"
+            printf '  %-18s %s\n' "Size"  "$(format_bytes "$SUMMARY_TOTAL_BYTES")"
+        fi
         printf '  %-18s %s\n' "Duration"  "$(format_duration "$duration_sec")"
         printf '  %-18s %s\n' "Dry run"   "$([[ "$DRY_RUN" -eq 1 ]] && echo yes || echo no)"
         printf '  %-18s %s\n' "Log"       "$LOG_FILE"
@@ -339,9 +349,12 @@ Options:
                      this flag, ALL configured sticks must be present.
                      Intended for offsite rotation workflows.
   --no-color         Disable colored output and animations.
+  --config FILE      Read settings from FILE (default: $USB_BACKUP_CONFIG,
+                     else ~/.config/usb-backup/config if it exists).
   -h, --help         Show this help message.
 
 Environment:
+  USB_BACKUP_CONFIG       Config file path (overridden by --config).
   USB_BACKUP_PASSPHRASE   If set: use instead of the interactive prompt.
                           Caution: a passphrase in env is visible in 'ps'
                           and shell history. Automation scenarios only.
@@ -352,13 +365,22 @@ EOF
 # Logging
 # -----------------------------------------------------------------------------
 
+log_to_file() {
+    # Append one plain line to the log file. No-op before init_logging
+    # (e.g. argument errors), so early die() calls don't fail on '>> ""'.
+    if [[ -n "$LOG_FILE" ]]; then
+        printf '%s\n' "$*" >> "$LOG_FILE"
+    fi
+    return 0
+}
+
 log() {
     # Plain to log file, dimmed timestamp to terminal.
     stop_spinner
     local ts msg
     ts="[$(date -u +%Y-%m-%dT%H:%M:%SZ)]"
     msg="$*"
-    printf '%s %s\n' "$ts" "$msg" >> "$LOG_FILE"
+    log_to_file "${ts} ${msg}"
     if [[ "$IS_TTY" -eq 1 ]]; then
         printf '  %s%s%s %s\n' "$C_DIM" "$ts" "$C_RESET" "$msg" >&2
     else
@@ -371,7 +393,7 @@ die() {
     shift
     stop_spinner
     print_fail "$*"
-    printf '[%s] FATAL: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$LOG_FILE"
+    log_to_file "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] FATAL: $*"
     exit "$code"
 }
 
@@ -383,7 +405,7 @@ require_tool() {
 }
 
 mount_point_for() {
-    printf '/Volumes/%s' "$1"
+    printf '%s/%s' "$VOLUMES_ROOT" "$1"
 }
 
 join_by() {
@@ -440,6 +462,10 @@ unlock_volume() {
         return 0
     fi
 
+    # Record before unlocking: if a signal arrives while diskutil runs, the
+    # volume may end up unlocked and cleanup must still lock it. lock_volume
+    # is a no-op for volumes that are not unlocked.
+    UNLOCKED_LABELS+=("$label")
     start_spinner "Unlocking ${label}"
     local unlock_rc=0
     printf '%s\n' "$PASSPHRASE" \
@@ -457,7 +483,6 @@ unlock_volume() {
         if [[ -d "$mount" ]]; then
             print_ok "${label} mounted at ${mount}"
             printf '[%s] %s mounted\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$label" >> "$LOG_FILE"
-            UNLOCKED_LABELS+=("$label")
             return 0
         fi
         sleep 1
@@ -579,6 +604,12 @@ generate_file_manifest() {
 
     local data_root="${root}/${DATA_SUBDIR}"
     if [[ ! -d "$data_root" ]]; then
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            # Fresh stick: phase 3 skips mkdir in dry-run mode.
+            : > "$out"
+            print_warn "${label}: no ${DATA_SUBDIR}/ yet (fresh stick); a real run would create it"
+            return 0
+        fi
         die 2 "Data directory missing: ${data_root}"
     fi
 
@@ -725,6 +756,13 @@ mirror_hub_to_secondaries() {
     hub_mount="$(mount_point_for "$HUB_LABEL")"
     local src="${hub_mount}/${DATA_SUBDIR}/"
 
+    if [[ "$DRY_RUN" -eq 1 && ! -d "$src" ]]; then
+        # Fresh hub: the dry-run sync above didn't create data/, so there is
+        # nothing to mirror from yet (rsync would fail on a missing source).
+        print_warn "[dry-run] hub ${HUB_LABEL} has no ${DATA_SUBDIR}/ yet; skipping mirror preview"
+        return 0
+    fi
+
     local dry_flag=()
     if [[ "$DRY_RUN" -eq 1 ]]; then
         dry_flag=("--dry-run")
@@ -781,10 +819,21 @@ verify_all_sticks_identical() {
             print_fail "Hash mismatch on ${label} vs hub ${HUB_LABEL}"
             {
                 printf '\n--- Hash diff %s vs %s (first 30 lines) ---\n' "$HUB_LABEL" "$label"
-                diff "$hub_hashes" "$other_hashes" | head -30
+                # diff exits 1 when files differ; under pipefail that would
+                # abort the script here (exit 1) instead of reaching exit 3.
+                diff "$hub_hashes" "$other_hashes" | head -30 || true
             } >> "$LOG_FILE"
         fi
     done
+
+    if [[ "${#mismatches[@]}" -gt 0 ]] && [[ "$DRY_RUN" -eq 1 ]]; then
+        # Nothing was synced, so out-of-date sticks (e.g. the offsite stick
+        # that just came home) are expected to differ. A real run fixes them.
+        print_warn "[dry-run] $(join_by "${mismatches[@]}") differ(s) from hub ${HUB_LABEL}; a real run would update them"
+        log "[dry-run] would update: $(join_by "${mismatches[@]}")"
+        VERIFIED_HUB_HASHES="$hub_hashes"
+        return 0
+    fi
 
     if [[ "${#mismatches[@]}" -gt 0 ]]; then
         log "Mismatches: $(join_by "${mismatches[@]}")"
@@ -852,6 +901,8 @@ write_manifests_to_all_sticks() {
     total_bytes="$(bytes_under_data "$hub_mount")"
     root_hash="$(root_hash_of_manifest "$VERIFIED_HUB_HASHES")"
 
+    SUMMARY_FILE_COUNT="$file_count"
+    SUMMARY_TOTAL_BYTES="$total_bytes"
     log "File count: $(format_number "$file_count"), total: $(format_bytes "$total_bytes"), root hash: ${root_hash}"
 
     local label
@@ -908,6 +959,8 @@ root_hash_of_manifest() {
 prompt_passphrase() {
     if [[ -n "${USB_BACKUP_PASSPHRASE:-}" ]]; then
         PASSPHRASE="$USB_BACKUP_PASSPHRASE"
+        # Don't leak it to rsync, diskutil or PRE_BACKUP_HOOK.
+        unset USB_BACKUP_PASSPHRASE
         log "Passphrase taken from environment."
         return 0
     fi
@@ -935,8 +988,25 @@ prompt_passphrase() {
 # Cleanup
 # -----------------------------------------------------------------------------
 
+on_err() {
+    # ERR trap (with set -E): report the command that tripped set -e, so an
+    # unexpected failure is not a silent "exit 1". Only the main shell
+    # reports; subshells and command substitutions would duplicate it.
+    local rc="$1" line="$2" cmd="$3"
+    [[ "${BASH_SUBSHELL:-0}" -eq 0 ]] || return 0
+    stop_spinner
+    print_fail "Unexpected error (exit ${rc}) at line ${line}: ${cmd}"
+    log_to_file "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] ERROR: exit ${rc} at line ${line}: ${cmd}"
+}
+
 cleanup() {
     local rc=$?
+    # INT/TERM handlers call exit, which fires EXIT again: run once only.
+    if [[ "$CLEANUP_DONE" -eq 1 ]]; then
+        return 0
+    fi
+    CLEANUP_DONE=1
+    trap - ERR
     PASSPHRASE=""
     stop_spinner
 
@@ -990,11 +1060,41 @@ parse_args() {
             --dry-run) DRY_RUN=1 ;;
             --available-only) AVAILABLE_ONLY=1 ;;
             --no-color) NO_COLOR=1 ;;
+            --config)
+                [[ $# -ge 2 ]] || { usage >&2; die 1 "--config needs a file path"; }
+                CONFIG_FILE="$2"
+                shift
+                ;;
             -h|--help) usage; exit 0 ;;
             *) usage >&2; die 1 "Unknown option: $1" ;;
         esac
         shift
     done
+}
+
+load_config() {
+    # Source the user's config file, if any, over the defaults above.
+    local f="$CONFIG_FILE"
+    if [[ -z "$f" ]]; then
+        f="${USB_BACKUP_CONFIG:-}"
+    fi
+    if [[ -z "$f" ]]; then
+        f="${HOME}/.config/usb-backup/config"
+        [[ -f "$f" ]] || return 0
+    fi
+    if [[ ! -f "$f" ]]; then
+        die 1 "Config file not found: $f"
+    fi
+    # It's executed as code: refuse files other users could have modified.
+    if [[ -n "$(find "$f" \( -perm -020 -o -perm -002 \) -print 2>/dev/null)" ]]; then
+        die 1 "Config file is group/world-writable, refusing to source it: $f (chmod 600 it)"
+    fi
+    if [[ -z "$(find "$f" -user "$(id -u)" -print 2>/dev/null)" ]]; then
+        die 1 "Config file is not owned by you, refusing to source it: $f"
+    fi
+    # shellcheck source=/dev/null
+    . "$f"
+    CONFIG_FILE="$f"
 }
 
 init_logging() {
@@ -1068,6 +1168,7 @@ preflight() {
     fi
 
     HUB_LABEL="${PRESENT_LABELS[0]}"
+    log "Config: ${CONFIG_FILE:-built-in defaults}"
     log "Hub: ${HUB_LABEL}"
     log "Present: $(join_by "${PRESENT_LABELS[@]}")"
     if [[ "${#MISSING_LABELS[@]}" -gt 0 ]]; then
@@ -1096,9 +1197,15 @@ run_pre_hook() {
 
 main() {
     parse_args "$@"
+    load_config
     init_tty
     init_logging
-    trap cleanup EXIT INT TERM
+    trap cleanup EXIT
+    # Convert signals into a normal exit with the conventional code, so
+    # cleanup sees a non-zero status and never reports "Backup Complete".
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'on_err "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
     printf '[%s] === start USB mirror backup (run %s) ===\n' \
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TIMESTAMP" >> "$LOG_FILE"

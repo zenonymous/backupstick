@@ -1,0 +1,49 @@
+#!/bin/bash
+# Mock of macOS diskutil for the test suite. State lives in $MOCK_STATE:
+#   <LABEL>.present   stick is plugged in
+#   <LABEL>.data/     contents of the volume while locked
+# Unlocking moves <LABEL>.data to $MOCK_VOLUMES/<LABEL>; locking moves it back.
+# Knobs: MOCK_PASSPHRASE (expected passphrase), MOCK_UNLOCK_DELAY (seconds),
+#        MOCK_LOCK_FAIL=<LABEL> (lockVolume fails once for that label).
+set -u
+st="${MOCK_STATE:?}"
+vol="${MOCK_VOLUMES:?}"
+echo "diskutil $*" >> "$st/diskutil.calls"
+
+label_of() { local l="${1#"$vol"/}"; printf '%s' "${l#/Volumes/}"; }
+
+case "${1:-}" in
+    info)
+        l="$(label_of "${2:-}")"
+        [[ -e "$st/$l.present" ]] || { echo "Could not find disk: $2" >&2; exit 1; }
+        echo "   Volume Name:               $l"
+        echo "   File System Personality:   Case-sensitive APFS"
+        ;;
+    apfs)
+        l="$(label_of "${3:-}")"
+        case "${2:-}" in
+            unlockVolume)
+                pw="$(cat)"
+                [[ -e "$st/$l.present" ]] || exit 1
+                [[ "$pw" == "${MOCK_PASSPHRASE:-secret}" ]] || { echo "Error: wrong passphrase" >&2; exit 1; }
+                sleep "${MOCK_UNLOCK_DELAY:-0}"
+                [[ -d "$vol/$l" ]] && exit 0
+                mkdir -p "$vol"
+                mv "$st/$l.data" "$vol/$l"
+                ;;
+            lockVolume)
+                if [[ "${MOCK_LOCK_FAIL:-}" == "$l" && ! -e "$st/$l.lockfailed" ]]; then
+                    touch "$st/$l.lockfailed"; echo "dissented" >&2; exit 1
+                fi
+                [[ -d "$vol/$l" ]] || exit 1
+                mv "$vol/$l" "$st/$l.data"
+                ;;
+            *) echo "mock diskutil: unsupported apfs verb $2" >&2; exit 1 ;;
+        esac
+        ;;
+    unmount)
+        # unmount force <mount>: pretend it worked
+        exit 0
+        ;;
+    *) echo "mock diskutil: unsupported verb ${1:-}" >&2; exit 1 ;;
+esac

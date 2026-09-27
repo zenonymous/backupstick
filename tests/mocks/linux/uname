@@ -1,0 +1,3 @@
+#!/bin/sh
+# Pretend to be macOS.
+echo Darwin
