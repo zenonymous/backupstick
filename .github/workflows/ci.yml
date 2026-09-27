@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck
+        run: shellcheck usb-mirror-backup.sh tests/*.sh tests/mocks/diskutil tests/mocks/linux/*
+
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test suite (bash 5, GNU tools, rsync 3.x)
+        run: tests/run-tests.sh
+
+  test-macos:
+    # The real target: /bin/bash 3.2, BSD tools, Apple's rsync.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tool versions
+        run: |
+          /bin/bash --version | head -1
+          rsync --version | head -2 || true
+          sw_vers
+      - name: Test suite under /bin/bash
+        run: BASH_UNDER_TEST=/bin/bash /bin/bash tests/run-tests.sh
