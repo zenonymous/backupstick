@@ -1,0 +1,44 @@
+# usb-mirror-backup.sh configuration
+#
+# Copy to ~/.config/usb-backup/config (the default location) and edit:
+#   mkdir -p ~/.config/usb-backup
+#   cp usb-backup.conf.example ~/.config/usb-backup/config
+#   chmod 600 ~/.config/usb-backup/config
+#
+# This file is sourced as bash. It must be owned by you and not writable by
+# group/others, otherwise the script refuses to load it. Anything you don't
+# set keeps the default from the top of usb-mirror-backup.sh.
+
+# Sticks, in order of preference for the hub role.
+LABELS=(BACKUP_A BACKUP_B BACKUP_C BACKUP_D)
+
+# Minimum sticks for --available-only (weekly runs with one stick offsite).
+MIN_STICKS_AVAILABLE=3
+
+# What to back up. Each entry is stored as data/<basename> on the sticks, so
+# basenames must be unique. Removing an entry here removes it from the sticks
+# on the next run (subject to the deletion guard).
+SOURCES=(
+    "${HOME}/Documents/backup-me"
+    "${HOME}/.ssh"
+    "${HOME}/.gnupg"
+    # "${HOME}/path/to/seed.gpg"
+    # "${HOME}/Library/Group Containers/group.com.apple.notes"
+)
+
+# Optional command run before syncing (e.g. export Apple Notes).
+# PRE_BACKUP_HOOK="osascript ${HOME}/bin/export-notes.scpt"
+
+# Deletion guard: stop if a run would delete more than MAX_DELETE_MIN files
+# AND more than MAX_DELETE_PERCENT % of the files on a stick. 0 disables.
+# MAX_DELETE_PERCENT=25
+# MAX_DELETE_MIN=10
+
+# Hard-linked snapshots of data/ kept per stick in history/. 0 disables.
+# HISTORY_KEEP=8
+
+# Reminders (--check-reminder / --install-reminder).
+# REMIND_AFTER_DAYS=8
+# REMIND_STICK_DAYS=42
+
+# LOG_DIR="${HOME}/Library/Logs/usb-backup"

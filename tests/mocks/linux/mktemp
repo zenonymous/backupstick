@@ -1,0 +1,8 @@
+#!/bin/bash
+# BSD `mktemp [-d] -t prefix` -> GNU mktemp needs an XXXXXX template.
+a=()
+while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "-t" ]]; then a+=(-t "$2.XXXXXX"); shift; else a+=("$1"); fi
+    shift
+done
+exec /usr/bin/mktemp "${a[@]}"
